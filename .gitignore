@@ -1,2 +1,5 @@
 *.wasm
 wasm_exec.js
+memory.db
+memory.db-shm
+memory.db-wal
