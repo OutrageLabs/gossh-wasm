@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>gossh-wasm — automated tests</title>
+  <style>
+    body { font-family: monospace; background: #111; color: #eee; padding: 16px; }
+    .pass { color: #4caf50; }
+    .fail { color: #f44336; }
+    .skip { color: #ff9800; }
+    #log { white-space: pre-wrap; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <h2>gossh-wasm test runner</h2>
+  <div id="log"></div>
+
+  <script src="../wasm_exec.js"></script>
+  <script>
+    const log = document.getElementById('log');
+    let passed = 0, failed = 0, skipped = 0;
+
+    function print(msg, cls) {
+      const span = document.createElement('span');
+      span.className = cls || '';
+      span.textContent = msg + '\n';
+      log.appendChild(span);
+    }
+
+    function assert(condition, name) {
+      if (condition) {
+        print(`  PASS: ${name}`, 'pass');
+        passed++;
+      } else {
+        print(`  FAIL: ${name}`, 'fail');
+        failed++;
+      }
+    }
+
+    async function runTests() {
+      print('Loading WASM...');
+      const go = new Go();
+      try {
+        const result = await WebAssembly.instantiateStreaming(
+          fetch('../gossh.wasm'), go.importObject
+        );
+        go.run(result.instance);
+        print('WASM loaded.\n');
+      } catch (err) {
+        print('WASM load failed: ' + err, 'fail');
+        return;
+      }
+
+      // ──── Test: GoSSH object exists ────
+      print('Test: GoSSH global object');
+      assert(typeof GoSSH === 'object', 'GoSSH is defined');
+      assert(typeof GoSSH.connect === 'function', 'GoSSH.connect exists');
+      assert(typeof GoSSH.write === 'function', 'GoSSH.write exists');
+      assert(typeof GoSSH.resize === 'function', 'GoSSH.resize exists');
+      assert(typeof GoSSH.disconnect === 'function', 'GoSSH.disconnect exists');
+
+      // ──── Test: Agent API ────
+      print('\nTest: Agent API');
+      assert(typeof GoSSH.agentAddKey === 'function', 'agentAddKey exists');
+      assert(typeof GoSSH.agentRemoveAll === 'function', 'agentRemoveAll exists');
+      assert(typeof GoSSH.agentListKeys === 'function', 'agentListKeys exists');
+
+      // Test agent operations.
+      GoSSH.agentRemoveAll();
+      const keys = GoSSH.agentListKeys();
+      assert(keys.length === 0, 'agent starts empty');
+
+      // ──── Test: SFTP API ────
+      print('\nTest: SFTP API');
+      assert(typeof GoSSH.sftpOpen === 'function', 'sftpOpen exists');
+      assert(typeof GoSSH.sftpClose === 'function', 'sftpClose exists');
+      assert(typeof GoSSH.sftpListDir === 'function', 'sftpListDir exists');
+      assert(typeof GoSSH.sftpUpload === 'function', 'sftpUpload exists');
+      assert(typeof GoSSH.sftpDownload === 'function', 'sftpDownload exists');
+      assert(typeof GoSSH.sftpDownloadStream === 'function', 'sftpDownloadStream exists');
+
+      // ──── Test: Port Forward API ────
+      print('\nTest: Port Forward API');
+      assert(typeof GoSSH.portForwardStart === 'function', 'portForwardStart exists');
+      assert(typeof GoSSH.portForwardStop === 'function', 'portForwardStop exists');
+      assert(typeof GoSSH.portForwardList === 'function', 'portForwardList exists');
+
+      // ──── Test: Internal streaming API ────
+      print('\nTest: Internal streaming API');
+      assert(typeof GoSSH._streamPull === 'function', '_streamPull exists');
+      assert(typeof GoSSH._streamCancel === 'function', '_streamCancel exists');
+
+      // ──── Test: Connect with missing params ────
+      print('\nTest: connect with missing params');
+      try {
+        await GoSSH.connect({});
+        assert(false, 'should throw on missing params');
+      } catch (err) {
+        assert(err.message.includes('required'), 'throws on missing required fields');
+      }
+
+      // ──── Test: Connect to non-existent proxy ────
+      print('\nTest: connect to non-existent proxy');
+      try {
+        await GoSSH.connect({
+          proxyUrl: 'ws://localhost:19999/relay',
+          host: 'example.com',
+          port: 22,
+          username: 'test',
+          authMethod: 'password',
+          password: 'test',
+          onData: () => {},
+          onClose: () => {},
+        });
+        assert(false, 'should throw on unreachable proxy');
+      } catch (err) {
+        assert(true, 'throws on unreachable proxy: ' + err.message);
+      }
+
+      // ──── Summary ────
+      print(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+      print(`Results: ${passed} passed, ${failed} failed, ${skipped} skipped`,
+        failed > 0 ? 'fail' : 'pass');
+
+      // Signal to automation
+      window.__testResults = { passed, failed, skipped };
+    }
+
+    runTests();
+  </script>
+</body>
+</html>

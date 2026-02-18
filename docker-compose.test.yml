@@ -1,0 +1,36 @@
+services:
+  sshserver:
+    image: lscr.io/linuxserver/openssh-server:latest
+    environment:
+      PUID: 1000
+      PGID: 1000
+      USER_NAME: testuser
+      USER_PASSWORD: testpass
+      PASSWORD_ACCESS: "true"
+    ports:
+      - "2222:2222"
+
+  wsproxy:
+    image: golang:1.25-alpine
+    working_dir: /app
+    volumes:
+      - ../wsproxy:/app
+    command: go run .
+    ports:
+      - "8080:8080"
+    environment:
+      PORT: "8080"
+      ALLOWED_ORIGINS: "*"
+      BLOCKED_TARGETS: "169.254.0.0/16"
+    depends_on:
+      - sshserver
+
+  # Serve WASM files for browser testing
+  webserver:
+    image: nginx:alpine
+    volumes:
+      - .:/usr/share/nginx/html:ro
+    ports:
+      - "8888:80"
+    depends_on:
+      - wsproxy
