@@ -40,15 +40,16 @@ self.addEventListener('fetch', (event) => {
   const streamId = parts[0];
   const filename = decodeURIComponent(parts.slice(1).join('/'));
 
-  event.respondWith(handleStreamRequest(streamId, filename));
+  // Use event.clientId to target the correct tab (multi-tab safe).
+  event.respondWith(handleStreamRequest(streamId, filename, event.clientId));
 });
 
-async function handleStreamRequest(streamId, filename) {
+async function handleStreamRequest(streamId, filename, clientId) {
   // We need to call GoSSH._streamPull(streamId) which is on the main thread.
   // Service Workers can't access the main thread's globals directly,
   // so we use a MessageChannel to communicate.
 
-  const client = await getControllingClient();
+  const client = await getSourceClient(clientId);
   if (!client) {
     return new Response('No controlling client', { status: 500 });
   }
@@ -72,10 +73,14 @@ async function handleStreamRequest(streamId, filename) {
     }
   });
 
+  // Sanitize filename for Content-Disposition to prevent header injection.
+  const safeName = filename.replace(/["\\\r\n]/g, '_');
+  const encodedName = encodeURIComponent(filename);
+
   return new Response(stream, {
     headers: {
       'Content-Type': 'application/octet-stream',
-      'Content-Disposition': `attachment; filename="${filename}"`,
+      'Content-Disposition': `attachment; filename="${safeName}"; filename*=UTF-8''${encodedName}`,
     }
   });
 }
@@ -88,7 +93,14 @@ function pullFromMain(client, streamId) {
   return new Promise((resolve, reject) => {
     const channel = new MessageChannel();
 
+    // Timeout if main thread doesn't respond within 30 seconds.
+    const timer = setTimeout(() => {
+      channel.port1.onmessage = null;
+      reject(new Error('pullFromMain: timeout waiting for main thread response'));
+    }, 30000);
+
     channel.port1.onmessage = (event) => {
+      clearTimeout(timer);
       if (event.data.error) {
         reject(new Error(event.data.error));
       } else {
@@ -110,7 +122,17 @@ function notifyCancel(client, streamId) {
   client.postMessage({ type: 'gossh-stream-cancel', streamId });
 }
 
-async function getControllingClient() {
+/**
+ * Get the client that initiated the stream request.
+ * Uses clientId from the fetch event for multi-tab safety.
+ * Falls back to the first window client if clientId is unavailable.
+ */
+async function getSourceClient(clientId) {
+  if (clientId) {
+    const client = await self.clients.get(clientId);
+    if (client) return client;
+  }
+  // Fallback for older browsers that don't provide clientId.
   const clients = await self.clients.matchAll({ type: 'window' });
   return clients[0] || null;
 }

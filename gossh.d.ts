@@ -29,6 +29,9 @@ interface GoSSHAPI {
   /** Add a PEM-encoded private key to the in-memory agent. Returns fingerprint. */
   agentAddKey(keyPEM: string, passphrase?: string): Promise<string>;
 
+  /** Remove a single key from the agent by fingerprint. */
+  agentRemoveKey(fingerprint: string): Promise<void>;
+
   /** Remove all keys from the agent. */
   agentRemoveAll(): void;
 
@@ -64,23 +67,27 @@ interface GoSSHAPI {
   /**
    * Upload data to a remote file.
    * @param onProgress - Called with (bytesWritten, totalBytes)
+   * @param signal - AbortSignal to cancel the transfer
    */
   sftpUpload(
     sftpId: string,
     remotePath: string,
     data: Uint8Array,
-    onProgress?: (bytes: number, total: number) => void
+    onProgress?: (bytes: number, total: number) => void,
+    signal?: AbortSignal
   ): Promise<void>;
 
   /**
    * Download a remote file into memory.
    * For files > 100MB, use sftpDownloadStream instead.
    * @param onProgress - Called with (bytesRead, totalBytes)
+   * @param signal - AbortSignal to cancel the transfer
    */
   sftpDownload(
     sftpId: string,
     remotePath: string,
-    onProgress?: (bytes: number, total: number) => void
+    onProgress?: (bytes: number, total: number) => void,
+    signal?: AbortSignal
   ): Promise<Uint8Array>;
 
   /**
@@ -94,6 +101,31 @@ interface GoSSHAPI {
     remotePath: string,
     onProgress?: (bytes: number, total: number) => void
   ): Promise<void>;
+
+  // ──── Streaming Upload ────
+
+  /**
+   * Start a streaming upload to a remote file.
+   * Returns an upload ID to use with sftpUploadStreamWrite/End.
+   * This avoids buffering the entire file in WASM memory.
+   *
+   * Usage:
+   *   const uploadId = await GoSSH.sftpUploadStreamStart(sftpId, '/path/file', fileSize);
+   *   for (const chunk of chunks) {
+   *     await GoSSH.sftpUploadStreamWrite(uploadId, chunk);
+   *   }
+   *   await GoSSH.sftpUploadStreamEnd(uploadId);
+   */
+  sftpUploadStreamStart(sftpId: string, remotePath: string, size: number): Promise<string>;
+
+  /** Push a chunk to an active streaming upload. */
+  sftpUploadStreamWrite(uploadId: string, chunk: Uint8Array): Promise<void>;
+
+  /** Finalize a streaming upload (waits for all writes to complete). */
+  sftpUploadStreamEnd(uploadId: string): Promise<void>;
+
+  /** Cancel an active streaming upload. */
+  sftpUploadStreamCancel(uploadId: string): void;
 
   // ──── Port Forwarding ────
 
@@ -140,6 +172,11 @@ interface SSHConnectConfig {
   keyPassphrase?: string;
   /** Enable SSH agent forwarding */
   agentForward?: boolean;
+  /**
+   * Jump host (ProxyJump) configuration.
+   * If provided, connects through the bastion host first.
+   */
+  jumpHost?: JumpHostConfig;
   /** Terminal columns (default: 80) */
   cols?: number;
   /** Terminal rows (default: 24) */
@@ -164,8 +201,12 @@ interface HostKeyInfo {
   hostname: string;
   /** SHA256 fingerprint (e.g., SHA256:xxx...) */
   fingerprint: string;
+  /** MD5 fingerprint (e.g., MD5:xx:xx:...) */
+  fingerprintMD5: string;
   /** Key type (e.g., ssh-ed25519, ssh-rsa) */
   keyType: string;
+  /** ASCII art visualization of the key (OpenSSH Bishop algorithm) */
+  randomArt: string;
 }
 
 interface FileInfo {
@@ -188,6 +229,31 @@ interface KeyInfo {
   type: string;
   /** Key comment */
   comment: string;
+  /** Key size in bits (e.g., 4096 for RSA, 256 for Ed25519) */
+  bits: number;
+  /** ASCII art visualization of the key (OpenSSH Bishop algorithm) */
+  randomArt: string;
+}
+
+interface JumpHostConfig {
+  /** Jump host (bastion) hostname or IP */
+  host: string;
+  /** Jump host port (default: 22) */
+  port?: number;
+  /** Jump host SSH username */
+  username: string;
+  /** Authentication method for jump host */
+  authMethod: 'password' | 'key' | 'agent';
+  /** Password for jump host password auth */
+  password?: string;
+  /** PEM-encoded private key for jump host key auth */
+  keyPEM?: string;
+  /** Passphrase for jump host encrypted key */
+  keyPassphrase?: string;
+  /** WebSocket proxy URL for jump host connection */
+  proxyUrl: string;
+  /** JWT token for proxy auth */
+  token?: string;
 }
 
 interface PortForwardConfig {

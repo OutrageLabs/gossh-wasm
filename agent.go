@@ -7,12 +7,30 @@
 package gossh
 
 import (
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/rsa"
 	"fmt"
 	"syscall/js"
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 )
+
+// keyBits returns the key size in bits for display (e.g., "RSA 4096-bit").
+func keyBits(pubKey ssh.PublicKey) int {
+	cryptoPub := pubKey.(ssh.CryptoPublicKey).CryptoPublicKey()
+	switch k := cryptoPub.(type) {
+	case *rsa.PublicKey:
+		return k.N.BitLen()
+	case *ecdsa.PublicKey:
+		return k.Curve.Params().BitSize
+	case ed25519.PublicKey:
+		return 256
+	default:
+		return 0
+	}
+}
 
 // globalAgent is the in-memory SSH agent shared across all sessions.
 // It implements the agent.Agent interface from golang.org/x/crypto/ssh/agent.
@@ -57,6 +75,26 @@ func agentAddKey(keyPEM string, passphrase string) js.Value {
 	})
 }
 
+// agentRemoveKey removes a single key from the agent by its SHA256 fingerprint.
+// Called from JS as: GoSSH.agentRemoveKey(fingerprint) → Promise<void>
+func agentRemoveKey(fingerprint string) js.Value {
+	return newPromise(func() (any, error) {
+		keys, err := globalAgent.List()
+		if err != nil {
+			return nil, fmt.Errorf("agentRemoveKey: list: %w", err)
+		}
+		for _, k := range keys {
+			if ssh.FingerprintSHA256(k) == fingerprint {
+				if err := globalAgent.Remove(k); err != nil {
+					return nil, fmt.Errorf("agentRemoveKey: remove: %w", err)
+				}
+				return nil, nil
+			}
+		}
+		return nil, fmt.Errorf("agentRemoveKey: key with fingerprint %q not found", fingerprint)
+	})
+}
+
 // agentRemoveAll removes all keys from the in-memory agent.
 // Called from JS as: GoSSH.agentRemoveAll()
 func agentRemoveAll() {
@@ -77,6 +115,8 @@ func agentListKeys() js.Value {
 			"fingerprint": ssh.FingerprintSHA256(k),
 			"type":        k.Type(),
 			"comment":     k.Comment,
+			"bits":        keyBits(k),
+			"randomArt":   RandomArt(k),
 		}
 		result.SetIndex(i, js.ValueOf(info))
 	}

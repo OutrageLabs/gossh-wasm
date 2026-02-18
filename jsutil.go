@@ -34,7 +34,12 @@ func newPromise(fn func() (any, error)) js.Value {
 		}()
 		return nil
 	})
-	return js.Global().Get("Promise").New(handler)
+	// Promise constructor invokes handler synchronously, so it's safe to
+	// release the js.Func immediately after. Without this, every API call
+	// leaks a permanent GC root.
+	promise := js.Global().Get("Promise").New(handler)
+	handler.Release()
+	return promise
 }
 
 // awaitPromise blocks the current goroutine until a JS Promise settles,

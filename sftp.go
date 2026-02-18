@@ -85,6 +85,7 @@ func sftpListDir(sftpID string, path string) js.Value {
 }
 
 // sftpStat returns file info for a single path.
+// Uses Lstat to correctly identify symlinks (Stat follows them).
 // Called from JS as: GoSSH.sftpStat(sftpId, path) → Promise<FileInfo>
 func sftpStat(sftpID string, path string) js.Value {
 	return newPromise(func() (any, error) {
@@ -93,7 +94,7 @@ func sftpStat(sftpID string, path string) js.Value {
 			return nil, err
 		}
 
-		info, err := client.Stat(path)
+		info, err := client.Lstat(path)
 		if err != nil {
 			return nil, fmt.Errorf("sftpStat: %w", err)
 		}
@@ -138,10 +139,16 @@ func sftpRemove(sftpID string, path string, recursive bool) js.Value {
 }
 
 // removeRecursive removes a directory and all its contents.
+// Uses Lstat to avoid following symlinks (prevents symlink traversal attacks).
 func removeRecursive(client *sftp.Client, path string) error {
-	info, err := client.Stat(path)
+	info, err := client.Lstat(path)
 	if err != nil {
 		return err
+	}
+
+	// If it's a symlink, just remove the link itself — don't follow it.
+	if info.Mode()&fs.ModeSymlink != 0 {
+		return client.Remove(path)
 	}
 
 	if !info.IsDir() {

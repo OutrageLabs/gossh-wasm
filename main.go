@@ -5,6 +5,7 @@
 package gossh
 
 import (
+	"fmt"
 	"syscall/js"
 )
 
@@ -57,6 +58,13 @@ func RegisterAPI() {
 			passphrase = args[1].String()
 		}
 		return agentAddKey(args[0].String(), passphrase)
+	})
+
+	gossh["agentRemoveKey"] = js.FuncOf(func(this js.Value, args []js.Value) any {
+		if len(args) < 1 {
+			return jsError(fmt.Errorf("agentRemoveKey: fingerprint required"))
+		}
+		return agentRemoveKey(args[0].String())
 	})
 
 	gossh["agentRemoveAll"] = js.FuncOf(func(this js.Value, args []js.Value) any {
@@ -135,33 +143,72 @@ func RegisterAPI() {
 		if len(args) < 3 {
 			return jsError(errMissingConfig)
 		}
-		var onProgress js.Value
+		onProgress := js.Undefined()
 		if len(args) > 3 {
 			onProgress = args[3]
 		}
-		return sftpUpload(args[0].String(), args[1].String(), args[2], onProgress)
+		signal := js.Undefined()
+		if len(args) > 4 {
+			signal = args[4]
+		}
+		return sftpUpload(args[0].String(), args[1].String(), args[2], onProgress, signal)
 	})
 
 	gossh["sftpDownload"] = js.FuncOf(func(this js.Value, args []js.Value) any {
 		if len(args) < 2 {
 			return jsError(errMissingConfig)
 		}
-		var onProgress js.Value
+		onProgress := js.Undefined()
 		if len(args) > 2 {
 			onProgress = args[2]
 		}
-		return sftpDownload(args[0].String(), args[1].String(), onProgress)
+		signal := js.Undefined()
+		if len(args) > 3 {
+			signal = args[3]
+		}
+		return sftpDownload(args[0].String(), args[1].String(), onProgress, signal)
 	})
 
 	gossh["sftpDownloadStream"] = js.FuncOf(func(this js.Value, args []js.Value) any {
 		if len(args) < 2 {
 			return jsError(errMissingConfig)
 		}
-		var onProgress js.Value
+		onProgress := js.Undefined()
 		if len(args) > 2 {
 			onProgress = args[2]
 		}
 		return sftpDownloadStream(args[0].String(), args[1].String(), onProgress)
+	})
+
+	// === Streaming Upload ===
+
+	gossh["sftpUploadStreamStart"] = js.FuncOf(func(this js.Value, args []js.Value) any {
+		if len(args) < 3 {
+			return jsError(errMissingConfig)
+		}
+		return sftpUploadStreamStart(args[0].String(), args[1].String(), int64(args[2].Float()))
+	})
+
+	gossh["sftpUploadStreamWrite"] = js.FuncOf(func(this js.Value, args []js.Value) any {
+		if len(args) < 2 {
+			return jsError(errMissingConfig)
+		}
+		return sftpUploadStreamWrite(args[0].String(), args[1])
+	})
+
+	gossh["sftpUploadStreamEnd"] = js.FuncOf(func(this js.Value, args []js.Value) any {
+		if len(args) < 1 {
+			return jsError(errMissingConfig)
+		}
+		return sftpUploadStreamEnd(args[0].String())
+	})
+
+	gossh["sftpUploadStreamCancel"] = js.FuncOf(func(this js.Value, args []js.Value) any {
+		if len(args) < 1 {
+			return nil
+		}
+		sftpUploadStreamCancel(args[0].String())
+		return nil
 	})
 
 	// Internal streaming API (called by Service Worker via stream_helper.js)

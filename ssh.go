@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"sync"
 	"syscall/js"
 	"time"
@@ -42,6 +43,10 @@ type session struct {
 	onData     js.Value // callback(Uint8Array)
 	onClose    js.Value // callback(string)
 	closeOnce  sync.Once
+
+	// Jump host resources (non-nil if ProxyJump was used).
+	jumpConn   *wsConn
+	jumpClient *ssh.Client
 }
 
 // sessionStore is the global map of active sessions, keyed by session ID.
@@ -57,75 +62,119 @@ func sshConnect(config js.Value) js.Value {
 		host := jsString(config.Get("host"))
 		port := jsInt(config.Get("port"), 22)
 		username := jsString(config.Get("username"))
-		authMethod := jsString(config.Get("authMethod"))
 
 		if proxyURL == "" || host == "" || username == "" {
 			return nil, fmt.Errorf("connect: proxyUrl, host, and username are required")
 		}
 
-		// Build the WebSocket URL with target host info for the proxy.
-		wsURL := fmt.Sprintf("%s?host=%s&port=%d", proxyURL, host, port)
-
-		// Append JWT token if present in config.
-		if token := jsString(config.Get("token")); token != "" {
-			wsURL += "&token=" + token
-		}
-
-		// Establish WebSocket connection to proxy.
-		dialCtx, dialCancel := context.WithTimeout(context.Background(), dialTimeout)
-		defer dialCancel()
-
-		netConn, err := DialWebSocket(dialCtx, wsURL)
+		// Build auth methods for the final host.
+		authMethods, err := buildAuthMethods(config)
 		if err != nil {
-			return nil, fmt.Errorf("connect: websocket dial: %w", err)
+			return nil, fmt.Errorf("connect: %w", err)
 		}
 
-		// Build SSH client config.
+		// Determine the transport: direct WS or through a jump host.
+		var netConn net.Conn
+		var jumpConn *wsConn
+		var jumpClient *ssh.Client
+
+		jumpConfig := config.Get("jumpHost")
+		hasJump := !jumpConfig.IsUndefined() && !jumpConfig.IsNull()
+
+		if hasJump {
+			// Jump host (ProxyJump) — connect to bastion first, then tunnel through.
+			jumpHost := jsString(jumpConfig.Get("host"))
+			jumpPort := jsInt(jumpConfig.Get("port"), 22)
+			jumpUser := jsString(jumpConfig.Get("username"))
+			if jumpHost == "" || jumpUser == "" {
+				return nil, fmt.Errorf("connect: jumpHost requires host and username")
+			}
+
+			jumpAuth, err := buildAuthMethods(jumpConfig)
+			if err != nil {
+				return nil, fmt.Errorf("connect: jump host: %w", err)
+			}
+
+			// Build WS URL for jump host.
+			u, err := url.Parse(proxyURL)
+			if err != nil {
+				return nil, fmt.Errorf("connect: invalid proxyUrl: %w", err)
+			}
+			q := u.Query()
+			q.Set("host", jumpHost)
+			q.Set("port", fmt.Sprintf("%d", jumpPort))
+			if token := jsString(config.Get("token")); token != "" {
+				q.Set("token", token)
+			}
+			u.RawQuery = q.Encode()
+
+			dialCtx, dialCancel := context.WithTimeout(context.Background(), dialTimeout)
+			defer dialCancel()
+
+			jConn, err := DialWebSocket(dialCtx, u.String())
+			if err != nil {
+				return nil, fmt.Errorf("connect: jump host websocket: %w", err)
+			}
+			jumpConn = jConn.(*wsConn)
+
+			jSSHConfig := &ssh.ClientConfig{
+				User:            jumpUser,
+				Auth:            jumpAuth,
+				HostKeyCallback: makeHostKeyCallback(jumpConfig),
+				Timeout:         sshHandshakeTimeout,
+			}
+
+			jSSHConn, jChans, jReqs, err := ssh.NewClientConn(jConn, fmt.Sprintf("%s:%d", jumpHost, jumpPort), jSSHConfig)
+			if err != nil {
+				jConn.Close()
+				return nil, fmt.Errorf("connect: jump host ssh handshake: %w", err)
+			}
+			jumpClient = ssh.NewClient(jSSHConn, jChans, jReqs)
+
+			// Tunnel through jump host to final destination.
+			netConn, err = jumpClient.Dial("tcp", fmt.Sprintf("%s:%d", host, port))
+			if err != nil {
+				jumpClient.Close()
+				return nil, fmt.Errorf("connect: jump host tunnel to %s:%d: %w", host, port, err)
+			}
+		} else {
+			// Direct connection through WebSocket proxy.
+			u, err := url.Parse(proxyURL)
+			if err != nil {
+				return nil, fmt.Errorf("connect: invalid proxyUrl: %w", err)
+			}
+			q := u.Query()
+			q.Set("host", host)
+			q.Set("port", fmt.Sprintf("%d", port))
+			if token := jsString(config.Get("token")); token != "" {
+				q.Set("token", token)
+			}
+			u.RawQuery = q.Encode()
+
+			dialCtx, dialCancel := context.WithTimeout(context.Background(), dialTimeout)
+			defer dialCancel()
+
+			netConn, err = DialWebSocket(dialCtx, u.String())
+			if err != nil {
+				return nil, fmt.Errorf("connect: websocket dial: %w", err)
+			}
+		}
+
+		// Build SSH client config for the final host.
 		sshConfig := &ssh.ClientConfig{
 			User:            username,
+			Auth:            authMethods,
 			HostKeyCallback: makeHostKeyCallback(config),
 			Timeout:         sshHandshakeTimeout,
 		}
 
-		// Configure authentication method.
-		switch authMethod {
-		case "password":
-			password := jsString(config.Get("password"))
-			if password == "" {
-				netConn.Close()
-				return nil, fmt.Errorf("connect: password required for password auth")
-			}
-			sshConfig.Auth = []ssh.AuthMethod{ssh.Password(password)}
-
-		case "key":
-			keyPEM := jsString(config.Get("keyPEM"))
-			if keyPEM == "" {
-				netConn.Close()
-				return nil, fmt.Errorf("connect: keyPEM required for key auth")
-			}
-			signer, err := parsePrivateKey(keyPEM, jsString(config.Get("keyPassphrase")))
-			if err != nil {
-				netConn.Close()
-				return nil, fmt.Errorf("connect: parse key: %w", err)
-			}
-			sshConfig.Auth = []ssh.AuthMethod{ssh.PublicKeys(signer)}
-
-		case "agent":
-			if globalAgent == nil {
-				netConn.Close()
-				return nil, fmt.Errorf("connect: no agent keys loaded")
-			}
-			sshConfig.Auth = []ssh.AuthMethod{ssh.PublicKeysCallback(globalAgent.Signers)}
-
-		default:
-			netConn.Close()
-			return nil, fmt.Errorf("connect: unknown authMethod %q (use password, key, or agent)", authMethod)
-		}
-
-		// SSH handshake over the WebSocket connection.
+		// SSH handshake over the transport (direct WS or tunneled through jump host).
 		sshConn, chans, reqs, err := ssh.NewClientConn(netConn, fmt.Sprintf("%s:%d", host, port), sshConfig)
 		if err != nil {
 			netConn.Close()
+			if jumpClient != nil {
+				jumpClient.Close()
+			}
 			return nil, fmt.Errorf("connect: ssh handshake: %w", err)
 		}
 
@@ -134,8 +183,11 @@ func sshConnect(config js.Value) js.Value {
 		// Set up agent forwarding if requested.
 		if jsBool(config.Get("agentForward")) && globalAgent != nil {
 			if err := agent.ForwardToAgent(sshClient, globalAgent); err != nil {
-				// Non-fatal: log but continue without agent forwarding.
-				_ = err
+				js.Global().Get("console").Call("warn",
+					"[gossh] Agent forwarding setup failed:", err.Error())
+			} else {
+				js.Global().Get("console").Call("info",
+					"[gossh] SSH agent forwarding enabled — the remote server can use your keys to connect to other servers.")
 			}
 		}
 
@@ -199,16 +251,24 @@ func sshConnect(config js.Value) js.Value {
 		// Create session context for lifecycle management.
 		sessCtx, sessCancel := context.WithCancel(context.Background())
 
+		// conn may be a *wsConn (direct) or nil (jump host — cleanup via jumpConn).
+		var wsC *wsConn
+		if wc, ok := netConn.(*wsConn); ok {
+			wsC = wc
+		}
+
 		sess := &session{
 			id:         sessionID,
 			ctx:        sessCtx,
 			cancel:     sessCancel,
-			conn:       netConn.(*wsConn),
+			conn:       wsC,
 			sshClient:  sshClient,
 			sshSession: sshSession,
 			stdin:      stdin,
 			onData:     config.Get("onData"),
 			onClose:    config.Get("onClose"),
+			jumpConn:   jumpConn,
+			jumpClient: jumpClient,
 		}
 
 		sessionStore.Store(sessionID, sess)
@@ -230,10 +290,12 @@ func sshConnect(config js.Value) js.Value {
 			sess.close("session ended")
 		}()
 
-		// Goroutine: SSH keepalive.
+		// Goroutine: SSH keepalive with backoff.
 		go func() {
 			ticker := time.NewTicker(keepaliveInterval)
 			defer ticker.Stop()
+			failures := 0
+			const maxFailures = 3
 			for {
 				select {
 				case <-sessCtx.Done():
@@ -241,9 +303,14 @@ func sshConnect(config js.Value) js.Value {
 				case <-ticker.C:
 					_, _, err := sshClient.SendRequest("keepalive@openssh.com", true, nil)
 					if err != nil {
-						sess.close("keepalive failed")
-						return
+						failures++
+						if failures >= maxFailures {
+							sess.close("keepalive failed after 3 attempts")
+							return
+						}
+						continue
 					}
+					failures = 0
 				}
 			}
 		}()
@@ -291,6 +358,25 @@ func (s *session) close(reason string) {
 	s.closeOnce.Do(func() {
 		s.cancel()
 
+		// Clean up any SFTP sessions tied to this SSH session.
+		sftpStore.Range(func(key, val any) bool {
+			ss := val.(*sftpSession)
+			if ss.sessionID == s.id {
+				ss.client.Close()
+				sftpStore.Delete(key)
+			}
+			return true
+		})
+
+		// Clean up any port forwards tied to this SSH session.
+		forwardStore.Range(func(key, val any) bool {
+			fwd := val.(*portForward)
+			if fwd.sessionID == s.id {
+				fwd.cleanup() // Uses cleanupOnce — safe to call even if handleTunnelMessages defer also calls it.
+			}
+			return true
+		})
+
 		if s.stdin != nil {
 			s.stdin.Close()
 		}
@@ -302,6 +388,14 @@ func (s *session) close(reason string) {
 		}
 		if s.conn != nil {
 			s.conn.Close()
+		}
+
+		// Clean up jump host resources.
+		if s.jumpClient != nil {
+			s.jumpClient.Close()
+		}
+		if s.jumpConn != nil {
+			s.jumpConn.Close()
 		}
 
 		sessionStore.Delete(s.id)
@@ -320,8 +414,12 @@ func (s *session) close(reason string) {
 func makeHostKeyCallback(config js.Value) ssh.HostKeyCallback {
 	onHostKey, hasCallback := getCallback(config, "onHostKey")
 	if !hasCallback {
-		// If no callback provided, accept all host keys (insecure but
-		// matches the "library doesn't store known_hosts" design).
+		// WARNING: Accepting all host keys makes the connection vulnerable to MITM.
+		// Callers SHOULD provide onHostKey for production use.
+		js.Global().Get("console").Call("warn",
+			"[gossh] No onHostKey callback provided — accepting all host keys. "+
+				"This is insecure and vulnerable to MITM attacks. "+
+				"Provide onHostKey in your connect config for production use.")
 		return ssh.InsecureIgnoreHostKey()
 	}
 
@@ -331,9 +429,11 @@ func makeHostKeyCallback(config js.Value) ssh.HostKeyCallback {
 
 		// Create the info object for JS.
 		info := map[string]any{
-			"hostname":    hostname,
-			"fingerprint": fingerprint,
-			"keyType":     keyType,
+			"hostname":       hostname,
+			"fingerprint":    fingerprint,
+			"fingerprintMD5": ssh.FingerprintLegacyMD5(key),
+			"keyType":        keyType,
+			"randomArt":      RandomArt(key),
 		}
 
 		// Call JS callback and await the Promise<boolean> result.
@@ -351,6 +451,39 @@ func makeHostKeyCallback(config js.Value) ssh.HostKeyCallback {
 			return fmt.Errorf("host key rejected by user")
 		}
 		return nil
+	}
+}
+
+// buildAuthMethods constructs SSH auth methods from a JS config object.
+func buildAuthMethods(config js.Value) ([]ssh.AuthMethod, error) {
+	authMethod := jsString(config.Get("authMethod"))
+	switch authMethod {
+	case "password":
+		password := jsString(config.Get("password"))
+		if password == "" {
+			return nil, fmt.Errorf("password required for password auth")
+		}
+		return []ssh.AuthMethod{ssh.Password(password)}, nil
+
+	case "key":
+		keyPEM := jsString(config.Get("keyPEM"))
+		if keyPEM == "" {
+			return nil, fmt.Errorf("keyPEM required for key auth")
+		}
+		signer, err := parsePrivateKey(keyPEM, jsString(config.Get("keyPassphrase")))
+		if err != nil {
+			return nil, fmt.Errorf("parse key: %w", err)
+		}
+		return []ssh.AuthMethod{ssh.PublicKeys(signer)}, nil
+
+	case "agent":
+		if globalAgent == nil {
+			return nil, fmt.Errorf("no agent keys loaded")
+		}
+		return []ssh.AuthMethod{ssh.PublicKeysCallback(globalAgent.Signers)}, nil
+
+	default:
+		return nil, fmt.Errorf("unknown authMethod %q (use password, key, or agent)", authMethod)
 	}
 }
 

@@ -55,6 +55,8 @@ type wsConn struct {
 	onMessage js.Func
 	onError   js.Func
 	onClose   js.Func
+
+	cleanupOnce sync.Once
 }
 
 // DialWebSocket creates a new WebSocket connection and returns it as net.Conn.
@@ -261,11 +263,14 @@ func (c *wsConn) Close() error {
 }
 
 // cleanup releases JS function references to prevent memory leaks.
+// Safe to call multiple times — only the first call releases.
 func (c *wsConn) cleanup() {
-	c.onOpen.Release()
-	c.onMessage.Release()
-	c.onError.Release()
-	c.onClose.Release()
+	c.cleanupOnce.Do(func() {
+		c.onOpen.Release()
+		c.onMessage.Release()
+		c.onError.Release()
+		c.onClose.Release()
+	})
 }
 
 // LocalAddr returns a dummy address (browsers don't expose local socket info).

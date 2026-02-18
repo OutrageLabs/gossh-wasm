@@ -76,23 +76,34 @@
       link.click();
       document.body.removeChild(link);
     } else {
-      // Fallback: pull all chunks into a Blob and trigger download.
+      // Fallback: pull chunks asynchronously into a Blob and trigger download.
+      // Uses setTimeout to yield to the event loop between chunks.
       console.warn(`[gossh] Using Blob fallback for ${filename} (${size} bytes)`);
       const chunks = [];
-      while (true) {
-        const result = GoSSH._streamPull(streamId);
-        if (result.done || !result.data) break;
-        chunks.push(result.data);
-      }
-      const blob = new Blob(chunks);
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.href = url;
-      link.download = filename;
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-      URL.revokeObjectURL(url);
+      const pullChunk = () => {
+        try {
+          const result = GoSSH._streamPull(streamId);
+          if (result.done || !result.data) {
+            // All chunks collected — create blob and download.
+            const blob = new Blob(chunks);
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = filename;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            URL.revokeObjectURL(url);
+            return;
+          }
+          chunks.push(result.data);
+          // Yield to event loop before pulling next chunk.
+          setTimeout(pullChunk, 0);
+        } catch (err) {
+          console.error('[gossh] Blob fallback failed:', err);
+        }
+      };
+      pullChunk();
     }
   });
 
