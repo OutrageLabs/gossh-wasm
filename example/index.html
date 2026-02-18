@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>gossh-wasm example</title>
+  <style>
+    body { font-family: monospace; background: #1a1a2e; color: #e0e0e0; padding: 20px; }
+    #terminal { background: #0f0f23; padding: 16px; border-radius: 8px; white-space: pre-wrap;
+                font-size: 14px; min-height: 400px; overflow-y: auto; }
+    .controls { margin-bottom: 16px; display: flex; gap: 8px; flex-wrap: wrap; }
+    input, button { font-family: monospace; padding: 6px 12px; border: 1px solid #333;
+                    background: #16213e; color: #e0e0e0; border-radius: 4px; }
+    button { cursor: pointer; background: #0f3460; }
+    button:hover { background: #1a5276; }
+    .status { color: #888; font-size: 12px; margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <h2>gossh-wasm — minimal example</h2>
+
+  <div class="controls">
+    <input id="proxy" placeholder="wss://proxy.example.com/relay" size="35">
+    <input id="host" placeholder="hostname" size="15">
+    <input id="port" placeholder="22" size="5" value="22">
+    <input id="user" placeholder="username" size="12">
+    <input id="pass" placeholder="password" size="15" type="password">
+    <button onclick="doConnect()">Connect</button>
+    <button onclick="doDisconnect()">Disconnect</button>
+  </div>
+  <div class="status" id="status">Loading WASM...</div>
+  <div id="terminal" tabindex="0"></div>
+
+  <script src="../wasm_exec.js"></script>
+  <script>
+    let sessionId = null;
+    const term = document.getElementById('terminal');
+    const status = document.getElementById('status');
+    const decoder = new TextDecoder();
+
+    // Load WASM
+    const go = new Go();
+    WebAssembly.instantiateStreaming(fetch('../gossh.wasm'), go.importObject)
+      .then(result => {
+        go.run(result.instance);
+        status.textContent = 'WASM loaded. GoSSH ready.';
+      })
+      .catch(err => {
+        status.textContent = 'WASM load error: ' + err;
+      });
+
+    async function doConnect() {
+      if (sessionId) { status.textContent = 'Already connected'; return; }
+
+      const proxyUrl = document.getElementById('proxy').value;
+      const host = document.getElementById('host').value;
+      const port = parseInt(document.getElementById('port').value) || 22;
+      const username = document.getElementById('user').value;
+      const password = document.getElementById('pass').value;
+
+      status.textContent = 'Connecting...';
+      term.textContent = '';
+
+      try {
+        sessionId = await GoSSH.connect({
+          proxyUrl, host, port, username,
+          authMethod: 'password',
+          password,
+          onData: (data) => {
+            term.textContent += decoder.decode(data);
+            term.scrollTop = term.scrollHeight;
+          },
+          onClose: (reason) => {
+            status.textContent = 'Disconnected: ' + reason;
+            sessionId = null;
+          },
+          onHostKey: async (info) => {
+            return confirm(
+              `Trust this host?\n\nHostname: ${info.hostname}\n` +
+              `Key type: ${info.keyType}\nFingerprint: ${info.fingerprint}`
+            );
+          },
+          onBanner: (banner) => {
+            term.textContent += banner + '\n';
+          },
+        });
+        status.textContent = 'Connected (session: ' + sessionId.slice(0, 8) + '...)';
+      } catch (err) {
+        status.textContent = 'Error: ' + err.message;
+        sessionId = null;
+      }
+    }
+
+    function doDisconnect() {
+      if (!sessionId) return;
+      GoSSH.disconnect(sessionId);
+      sessionId = null;
+    }
+
+    // Capture keyboard input and send to SSH
+    term.addEventListener('keydown', (e) => {
+      if (!sessionId) return;
+      e.preventDefault();
+
+      let data;
+      if (e.key === 'Enter') data = '\r';
+      else if (e.key === 'Backspace') data = '\x7f';
+      else if (e.key === 'Tab') data = '\t';
+      else if (e.key === 'Escape') data = '\x1b';
+      else if (e.key === 'ArrowUp') data = '\x1b[A';
+      else if (e.key === 'ArrowDown') data = '\x1b[B';
+      else if (e.key === 'ArrowRight') data = '\x1b[C';
+      else if (e.key === 'ArrowLeft') data = '\x1b[D';
+      else if (e.ctrlKey && e.key.length === 1) {
+        const code = e.key.toUpperCase().charCodeAt(0) - 64;
+        if (code >= 0 && code <= 31) data = String.fromCharCode(code);
+      }
+      else if (e.key.length === 1) data = e.key;
+
+      if (data) {
+        const encoded = new TextEncoder().encode(data);
+        GoSSH.write(sessionId, encoded);
+      }
+    });
+  </script>
+</body>
+</html>
