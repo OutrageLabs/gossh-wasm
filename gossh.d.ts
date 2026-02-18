@@ -66,6 +66,7 @@ interface GoSSHAPI {
 
   /**
    * Upload data to a remote file.
+   * For files > 512MB, use streaming upload APIs.
    * @param onProgress - Called with (bytesWritten, totalBytes)
    * @param signal - AbortSignal to cancel the transfer
    */
@@ -147,10 +148,10 @@ interface GoSSHAPI {
   // ──── Internal (used by Service Worker) ────
 
   /** @internal Pull next chunk for streaming download. */
-  _streamPull(streamId: string): { data: Uint8Array | null; done: boolean };
+  _streamPull(streamId: string, streamToken: string): { data: Uint8Array | null; done: boolean };
 
   /** @internal Cancel a streaming download. */
-  _streamCancel(streamId: string): void;
+  _streamCancel(streamId: string, streamToken: string): void;
 }
 
 interface SSHConnectConfig {
@@ -173,6 +174,21 @@ interface SSHConnectConfig {
   /** Enable SSH agent forwarding */
   agentForward?: boolean;
   /**
+   * Allow ws:// proxy URLs for development only.
+   * Production should always use wss://.
+   */
+  allowInsecureWS?: boolean;
+  /**
+   * Allow connecting without onHostKey callback (insecure, MITM-prone).
+   * Intended for local development only.
+   */
+  allowInsecureHostKey?: boolean;
+  /**
+   * Enable strict remote path validation for SFTP operations.
+   * When true, paths must be absolute and cannot contain '..' segments.
+   */
+  strictSFTPPaths?: boolean;
+  /**
    * Jump host (ProxyJump) configuration.
    * If provided, connects through the bastion host first.
    */
@@ -191,6 +207,7 @@ interface SSHConnectConfig {
   /**
    * Called for host key verification.
    * Return true to accept the key, false to reject.
+   * Required unless allowInsecureHostKey is set.
    */
   onHostKey?: (info: HostKeyInfo) => Promise<boolean>;
   /** Called with the SSH server banner */
@@ -254,6 +271,8 @@ interface JumpHostConfig {
   proxyUrl: string;
   /** JWT token for proxy auth */
   token?: string;
+  /** Allow ws:// jump proxy URL for development only */
+  allowInsecureWS?: boolean;
 }
 
 interface PortForwardConfig {
@@ -265,6 +284,8 @@ interface PortForwardConfig {
   proxyTunnelUrl: string;
   /** JWT token for proxy auth */
   token?: string;
+  /** Allow ws:// tunnel proxy URL for development only */
+  allowInsecureWS?: boolean;
 }
 
 interface TunnelInfo {

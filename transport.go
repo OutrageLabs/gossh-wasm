@@ -25,6 +25,10 @@ const (
 	// wsWriteChunkSize is the max bytes per WebSocket send() call.
 	// Matches sshterm's proven chunk size for SSH-over-WS throughput.
 	wsWriteChunkSize = 4096
+
+	// wsMaxMessageSize bounds one incoming WebSocket frame to prevent
+	// unbounded allocation from malicious or compromised peers.
+	wsMaxMessageSize = 8 * 1024 * 1024 // 8 MB
 )
 
 var (
@@ -32,6 +36,8 @@ var (
 	errWSNotOpen    = errors.New("websocket: not in OPEN state")
 	errDialTimeout  = errors.New("websocket: dial timeout")
 	errDialFailed   = errors.New("websocket: dial failed")
+	errWSFrameLarge = errors.New("websocket: incoming frame too large")
+	errWSBackpress  = errors.New("websocket: receive buffer overflow")
 )
 
 // wsConn implements net.Conn over a browser WebSocket.
@@ -46,9 +52,9 @@ type wsConn struct {
 	err    error
 	closed bool
 
-	ws      js.Value   // browser WebSocket object
-	readCh  chan []byte // incoming message data
-	buf     []byte     // leftover bytes from previous Read()
+	ws     js.Value    // browser WebSocket object
+	readCh chan []byte // incoming message data
+	buf    []byte      // leftover bytes from previous Read()
 
 	// JS function references (prevent GC while registered)
 	onOpen    js.Func
@@ -118,14 +124,40 @@ func DialWebSocket(ctx context.Context, url string) (net.Conn, error) {
 		event := args[0]
 		arrayBuf := event.Get("data")
 
-		// Copy ArrayBuffer → Go []byte
 		uint8Array := js.Global().Get("Uint8Array").New(arrayBuf)
-		data := make([]byte, uint8Array.Get("byteLength").Int())
+		size := uint8Array.Get("byteLength").Int()
+		if size > wsMaxMessageSize {
+			c.mu.Lock()
+			if c.err == nil {
+				c.err = errWSFrameLarge
+			}
+			c.mu.Unlock()
+			c.cancel()
+			state := c.ws.Get("readyState").Int()
+			if state == 0 || state == 1 { // CONNECTING or OPEN
+				c.ws.Call("close")
+			}
+			return nil
+		}
+
+		// Copy ArrayBuffer → Go []byte
+		data := make([]byte, size)
 		js.CopyBytesToGo(data, uint8Array)
 
 		select {
 		case c.readCh <- data:
 		case <-c.ctx.Done():
+		default:
+			c.mu.Lock()
+			if c.err == nil {
+				c.err = errWSBackpress
+			}
+			c.mu.Unlock()
+			c.cancel()
+			state := c.ws.Get("readyState").Int()
+			if state == 0 || state == 1 { // CONNECTING or OPEN
+				c.ws.Call("close")
+			}
 		}
 		return nil
 	})

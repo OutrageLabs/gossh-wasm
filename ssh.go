@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/url"
 	"sync"
 	"syscall/js"
 	"time"
@@ -43,6 +42,8 @@ type session struct {
 	onData     js.Value // callback(Uint8Array)
 	onClose    js.Value // callback(string)
 	closeOnce  sync.Once
+	// strictSFTPPaths enables optional conservative path policy checks.
+	strictSFTPPaths bool
 
 	// Jump host resources (non-nil if ProxyJump was used).
 	jumpConn   *wsConn
@@ -62,6 +63,8 @@ func sshConnect(config js.Value) js.Value {
 		host := jsString(config.Get("host"))
 		port := jsInt(config.Get("port"), 22)
 		username := jsString(config.Get("username"))
+		allowInsecureWS := jsBool(config.Get("allowInsecureWS"))
+		strictSFTPPaths := jsBool(config.Get("strictSFTPPaths"))
 
 		if proxyURL == "" || host == "" || username == "" {
 			return nil, fmt.Errorf("connect: proxyUrl, host, and username are required")
@@ -96,9 +99,14 @@ func sshConnect(config js.Value) js.Value {
 			}
 
 			// Build WS URL for jump host.
-			u, err := url.Parse(proxyURL)
+			jumpProxyURL := jsString(jumpConfig.Get("proxyUrl"))
+			if jumpProxyURL == "" {
+				jumpProxyURL = proxyURL
+			}
+			jumpAllowInsecureWS := allowInsecureWS || jsBool(jumpConfig.Get("allowInsecureWS"))
+			u, err := parseWebSocketURL(jumpProxyURL, jumpAllowInsecureWS)
 			if err != nil {
-				return nil, fmt.Errorf("connect: invalid proxyUrl: %w", err)
+				return nil, fmt.Errorf("connect: jump host proxy: %w", err)
 			}
 			q := u.Query()
 			q.Set("host", jumpHost)
@@ -113,7 +121,7 @@ func sshConnect(config js.Value) js.Value {
 
 			jConn, err := DialWebSocket(dialCtx, u.String())
 			if err != nil {
-				return nil, fmt.Errorf("connect: jump host websocket: %w", err)
+				return nil, publicErr("connect: failed to establish jump-host WebSocket", err)
 			}
 			jumpConn = jConn.(*wsConn)
 
@@ -126,22 +134,22 @@ func sshConnect(config js.Value) js.Value {
 
 			jSSHConn, jChans, jReqs, err := ssh.NewClientConn(jConn, fmt.Sprintf("%s:%d", jumpHost, jumpPort), jSSHConfig)
 			if err != nil {
-				jConn.Close()
-				return nil, fmt.Errorf("connect: jump host ssh handshake: %w", err)
+				closeQuietly(jConn)
+				return nil, publicErr("connect: jump-host SSH handshake failed", err)
 			}
 			jumpClient = ssh.NewClient(jSSHConn, jChans, jReqs)
 
 			// Tunnel through jump host to final destination.
 			netConn, err = jumpClient.Dial("tcp", fmt.Sprintf("%s:%d", host, port))
 			if err != nil {
-				jumpClient.Close()
-				return nil, fmt.Errorf("connect: jump host tunnel to %s:%d: %w", host, port, err)
+				closeQuietly(jumpClient)
+				return nil, publicErr("connect: jump-host tunnel failed", err)
 			}
 		} else {
 			// Direct connection through WebSocket proxy.
-			u, err := url.Parse(proxyURL)
+			u, err := parseWebSocketURL(proxyURL, allowInsecureWS)
 			if err != nil {
-				return nil, fmt.Errorf("connect: invalid proxyUrl: %w", err)
+				return nil, err
 			}
 			q := u.Query()
 			q.Set("host", host)
@@ -156,7 +164,7 @@ func sshConnect(config js.Value) js.Value {
 
 			netConn, err = DialWebSocket(dialCtx, u.String())
 			if err != nil {
-				return nil, fmt.Errorf("connect: websocket dial: %w", err)
+				return nil, publicErr("connect: failed to establish WebSocket", err)
 			}
 		}
 
@@ -171,11 +179,11 @@ func sshConnect(config js.Value) js.Value {
 		// SSH handshake over the transport (direct WS or tunneled through jump host).
 		sshConn, chans, reqs, err := ssh.NewClientConn(netConn, fmt.Sprintf("%s:%d", host, port), sshConfig)
 		if err != nil {
-			netConn.Close()
+			closeQuietly(netConn)
 			if jumpClient != nil {
-				jumpClient.Close()
+				closeQuietly(jumpClient)
 			}
-			return nil, fmt.Errorf("connect: ssh handshake: %w", err)
+			return nil, publicErr("connect: SSH handshake failed", err)
 		}
 
 		sshClient := ssh.NewClient(sshConn, chans, reqs)
@@ -194,8 +202,8 @@ func sshConnect(config js.Value) js.Value {
 		// Open an SSH session for the terminal.
 		sshSession, err := sshClient.NewSession()
 		if err != nil {
-			sshClient.Close()
-			return nil, fmt.Errorf("connect: new session: %w", err)
+			closeQuietly(sshClient)
+			return nil, publicErr("connect: failed to open SSH session", err)
 		}
 
 		// Request agent forwarding on the session if enabled.
@@ -220,32 +228,32 @@ func sshConnect(config js.Value) js.Value {
 			ssh.TTY_OP_OSPEED: 14400,
 		}
 		if err := sshSession.RequestPty("xterm-256color", rows, cols, modes); err != nil {
-			sshSession.Close()
-			sshClient.Close()
-			return nil, fmt.Errorf("connect: request pty: %w", err)
+			closeQuietly(sshSession)
+			closeQuietly(sshClient)
+			return nil, publicErr("connect: PTY request failed", err)
 		}
 
 		// Set up stdin pipe.
 		stdin, err := sshSession.StdinPipe()
 		if err != nil {
-			sshSession.Close()
-			sshClient.Close()
-			return nil, fmt.Errorf("connect: stdin pipe: %w", err)
+			closeQuietly(sshSession)
+			closeQuietly(sshClient)
+			return nil, publicErr("connect: failed to open stdin pipe", err)
 		}
 
 		// Set up stdout pipe.
 		stdout, err := sshSession.StdoutPipe()
 		if err != nil {
-			sshSession.Close()
-			sshClient.Close()
-			return nil, fmt.Errorf("connect: stdout pipe: %w", err)
+			closeQuietly(sshSession)
+			closeQuietly(sshClient)
+			return nil, publicErr("connect: failed to open stdout pipe", err)
 		}
 
 		// Start shell.
 		if err := sshSession.Shell(); err != nil {
-			sshSession.Close()
-			sshClient.Close()
-			return nil, fmt.Errorf("connect: shell: %w", err)
+			closeQuietly(sshSession)
+			closeQuietly(sshClient)
+			return nil, publicErr("connect: failed to start shell", err)
 		}
 
 		// Create session context for lifecycle management.
@@ -258,17 +266,18 @@ func sshConnect(config js.Value) js.Value {
 		}
 
 		sess := &session{
-			id:         sessionID,
-			ctx:        sessCtx,
-			cancel:     sessCancel,
-			conn:       wsC,
-			sshClient:  sshClient,
-			sshSession: sshSession,
-			stdin:      stdin,
-			onData:     config.Get("onData"),
-			onClose:    config.Get("onClose"),
-			jumpConn:   jumpConn,
-			jumpClient: jumpClient,
+			id:              sessionID,
+			ctx:             sessCtx,
+			cancel:          sessCancel,
+			conn:            wsC,
+			sshClient:       sshClient,
+			sshSession:      sshSession,
+			stdin:           stdin,
+			onData:          config.Get("onData"),
+			onClose:         config.Get("onClose"),
+			strictSFTPPaths: strictSFTPPaths,
+			jumpConn:        jumpConn,
+			jumpClient:      jumpClient,
 		}
 
 		sessionStore.Store(sessionID, sess)
@@ -362,7 +371,7 @@ func (s *session) close(reason string) {
 		sftpStore.Range(func(key, val any) bool {
 			ss := val.(*sftpSession)
 			if ss.sessionID == s.id {
-				ss.client.Close()
+				closeQuietly(ss.client)
 				sftpStore.Delete(key)
 			}
 			return true
@@ -378,24 +387,24 @@ func (s *session) close(reason string) {
 		})
 
 		if s.stdin != nil {
-			s.stdin.Close()
+			closeQuietly(s.stdin)
 		}
 		if s.sshSession != nil {
-			s.sshSession.Close()
+			closeQuietly(s.sshSession)
 		}
 		if s.sshClient != nil {
-			s.sshClient.Close()
+			closeQuietly(s.sshClient)
 		}
 		if s.conn != nil {
-			s.conn.Close()
+			closeQuietly(s.conn)
 		}
 
 		// Clean up jump host resources.
 		if s.jumpClient != nil {
-			s.jumpClient.Close()
+			closeQuietly(s.jumpClient)
 		}
 		if s.jumpConn != nil {
-			s.jumpConn.Close()
+			closeQuietly(s.jumpConn)
 		}
 
 		sessionStore.Delete(s.id)
@@ -414,13 +423,13 @@ func (s *session) close(reason string) {
 func makeHostKeyCallback(config js.Value) ssh.HostKeyCallback {
 	onHostKey, hasCallback := getCallback(config, "onHostKey")
 	if !hasCallback {
-		// WARNING: Accepting all host keys makes the connection vulnerable to MITM.
-		// Callers SHOULD provide onHostKey for production use.
-		js.Global().Get("console").Call("warn",
-			"[gossh] No onHostKey callback provided — accepting all host keys. "+
-				"This is insecure and vulnerable to MITM attacks. "+
-				"Provide onHostKey in your connect config for production use.")
-		return ssh.InsecureIgnoreHostKey()
+		if jsBool(config.Get("allowInsecureHostKey")) {
+			logWarnf("No onHostKey callback provided — accepting all host keys. This is insecure and vulnerable to MITM attacks.")
+			return ssh.InsecureIgnoreHostKey() // #nosec G106 -- explicit development opt-in only.
+		}
+		return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+			return errHostKeyCallbackRequired
+		}
 	}
 
 	return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
@@ -492,11 +501,15 @@ func buildAuthMethods(config js.Value) ([]ssh.AuthMethod, error) {
 func parsePrivateKey(keyPEM string, passphrase string) (ssh.Signer, error) {
 	var signer ssh.Signer
 	var err error
+	keyBytes := []byte(keyPEM)
+	defer scrubBytes(keyBytes)
 
 	if passphrase != "" {
-		signer, err = ssh.ParsePrivateKeyWithPassphrase([]byte(keyPEM), []byte(passphrase))
+		passBytes := []byte(passphrase)
+		defer scrubBytes(passBytes)
+		signer, err = ssh.ParsePrivateKeyWithPassphrase(keyBytes, passBytes)
 	} else {
-		signer, err = ssh.ParsePrivateKey([]byte(keyPEM))
+		signer, err = ssh.ParsePrivateKey(keyBytes)
 	}
 	if err != nil {
 		return nil, err

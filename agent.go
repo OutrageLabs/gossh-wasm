@@ -19,7 +19,11 @@ import (
 
 // keyBits returns the key size in bits for display (e.g., "RSA 4096-bit").
 func keyBits(pubKey ssh.PublicKey) int {
-	cryptoPub := pubKey.(ssh.CryptoPublicKey).CryptoPublicKey()
+	cryptoPubKey, ok := pubKey.(ssh.CryptoPublicKey)
+	if !ok {
+		return 0
+	}
+	cryptoPub := cryptoPubKey.CryptoPublicKey()
 	switch k := cryptoPub.(type) {
 	case *rsa.PublicKey:
 		return k.N.BitLen()
@@ -48,10 +52,14 @@ func agentAddKey(keyPEM string, passphrase string) js.Value {
 		// Parse raw private key (rsa, ed25519, ecdsa, etc.)
 		var rawKey any
 		var err error
+		keyBytes := []byte(keyPEM)
+		defer scrubBytes(keyBytes)
 		if passphrase != "" {
-			rawKey, err = ssh.ParseRawPrivateKeyWithPassphrase([]byte(keyPEM), []byte(passphrase))
+			passBytes := []byte(passphrase)
+			defer scrubBytes(passBytes)
+			rawKey, err = ssh.ParseRawPrivateKeyWithPassphrase(keyBytes, passBytes)
 		} else {
-			rawKey, err = ssh.ParseRawPrivateKey([]byte(keyPEM))
+			rawKey, err = ssh.ParseRawPrivateKey(keyBytes)
 		}
 		if err != nil {
 			return nil, fmt.Errorf("agentAddKey: %w", err)
@@ -98,7 +106,9 @@ func agentRemoveKey(fingerprint string) js.Value {
 // agentRemoveAll removes all keys from the in-memory agent.
 // Called from JS as: GoSSH.agentRemoveAll()
 func agentRemoveAll() {
-	globalAgent.RemoveAll()
+	if err := globalAgent.RemoveAll(); err != nil {
+		logWarnf("agentRemoveAll failed:", err.Error())
+	}
 }
 
 // agentListKeys returns information about all keys in the agent.

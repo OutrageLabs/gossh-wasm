@@ -1,6 +1,7 @@
 services:
   sshserver:
-    image: lscr.io/linuxserver/openssh-server:latest
+    # Use pinned image tags/digests via env vars.
+    image: ${SSHSERVER_IMAGE:?Set SSHSERVER_IMAGE to a pinned image tag or digest}
     environment:
       PUID: 1000
       PGID: 1000
@@ -11,7 +12,7 @@ services:
       - "2222:2222"
 
   wsproxy:
-    image: golang:1.25-alpine
+    image: ${WSPROXY_GO_IMAGE:?Set WSPROXY_GO_IMAGE to a pinned image tag or digest}
     working_dir: /app
     volumes:
       - ../wsproxy:/app
@@ -20,14 +21,14 @@ services:
       - "8080:8080"
     environment:
       PORT: "8080"
-      ALLOWED_ORIGINS: "*"
+      ALLOWED_ORIGINS: "http://localhost:8888,http://127.0.0.1:8888"
       BLOCKED_TARGETS: "169.254.0.0/16"
     depends_on:
       - sshserver
 
   # Serve WASM files for browser testing
   webserver:
-    image: nginx:alpine
+    image: ${WEBSERVER_IMAGE:?Set WEBSERVER_IMAGE to a pinned image tag or digest}
     volumes:
       - .:/usr/share/nginx/html:ro
     ports:

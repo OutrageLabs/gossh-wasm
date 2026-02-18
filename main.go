@@ -136,7 +136,11 @@ func RegisterAPI() {
 		if len(args) < 3 {
 			return jsError(errMissingConfig)
 		}
-		return sftpChmod(args[0].String(), args[1].String(), uint32(args[2].Int()))
+		mode := args[2].Int()
+		if mode < 0 || mode > 0o7777 {
+			return jsError(fmt.Errorf("sftpChmod: mode must be between 0 and 07777"))
+		}
+		return sftpChmod(args[0].String(), args[1].String(), uint32(mode))
 	})
 
 	gossh["sftpUpload"] = js.FuncOf(func(this js.Value, args []js.Value) any {
@@ -213,17 +217,17 @@ func RegisterAPI() {
 
 	// Internal streaming API (called by Service Worker via stream_helper.js)
 	gossh["_streamPull"] = js.FuncOf(func(this js.Value, args []js.Value) any {
-		if len(args) < 1 {
+		if len(args) < 2 {
 			return js.ValueOf(map[string]any{"data": js.Null(), "done": true})
 		}
-		return streamPull(args[0].String())
+		return streamPull(args[0].String(), args[1].String())
 	})
 
 	gossh["_streamCancel"] = js.FuncOf(func(this js.Value, args []js.Value) any {
-		if len(args) < 1 {
+		if len(args) < 2 {
 			return nil
 		}
-		streamCancel(args[0].String())
+		streamCancel(args[0].String(), args[1].String())
 		return nil
 	})
 

@@ -4,6 +4,11 @@ Go SSH client compiled to WebAssembly — full SSH, SFTP, agent forwarding, and 
 
 All cryptography runs in the browser via `golang.org/x/crypto/ssh`. The proxy ([wsproxy](https://github.com/OutrageLabs/wsproxy)) only relays encrypted bytes — zero-knowledge architecture.
 
+Security defaults:
+- Host key verification is fail-closed by default (`onHostKey` required unless explicitly opting into insecure mode for development).
+- `wss://` proxy URLs are required by default (`ws://` allowed only with explicit development override).
+- Non-streaming SFTP upload/download APIs enforce 512MB limits; use streaming APIs for larger files.
+
 ## Features
 
 - **SSH sessions** — connect, PTY, resize, keepalive, host key verification
@@ -105,12 +110,15 @@ make optimize     # → wasm-opt -Oz (requires binaryen)
   keyPEM?: string;       // PEM-encoded private key
   keyPassphrase?: string;
   agentForward?: boolean;
+  allowInsecureWS?: boolean;     // Dev only: allow ws:// proxy URL
+  allowInsecureHostKey?: boolean;// Dev only: disable host key verification
+  strictSFTPPaths?: boolean;     // Optional: enforce absolute, non-traversal SFTP paths
   cols?: number;         // Terminal columns (default: 80)
   rows?: number;         // Terminal rows (default: 24)
   token?: string;        // JWT for proxy auth
   onData: (data: Uint8Array) => void;
   onClose: (reason: string) => void;
-  onHostKey: (info: HostKeyInfo) => Promise<boolean>;
+  onHostKey: (info: HostKeyInfo) => Promise<boolean>; // required unless allowInsecureHostKey=true
   onBanner?: (banner: string) => void;
 }
 ```

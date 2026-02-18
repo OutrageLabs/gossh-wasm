@@ -26,6 +26,9 @@ const (
 	// maxDownloadSize is the maximum file size for in-memory sftpDownload.
 	// WASM memory is limited; use sftpDownloadStream for larger files.
 	maxDownloadSize = 512 * 1024 * 1024 // 512 MB
+	// maxUploadSize is the maximum file size for non-streaming sftpUpload.
+	// For larger files use sftpUploadStream* APIs.
+	maxUploadSize = 512 * 1024 * 1024 // 512 MB
 )
 
 // sftpUpload uploads data from a JS Uint8Array to a remote file.
@@ -34,26 +37,31 @@ const (
 //	GoSSH.sftpUpload(sftpId, remotePath, data: Uint8Array, onProgress?, signal?: AbortSignal) → Promise<void>
 func sftpUpload(sftpID string, remotePath string, data js.Value, onProgress js.Value, signal js.Value) js.Value {
 	return newPromise(func() (any, error) {
-		client, err := getSFTPClient(sftpID)
+		ss, err := getSFTPSession(sftpID)
 		if err != nil {
 			return nil, err
 		}
+		remotePath, err = validateSFTPPath(remotePath, ss.strict)
+		if err != nil {
+			return nil, fmt.Errorf("sftpUpload: %w", err)
+		}
 
-		// Convert JS Uint8Array to Go bytes.
+		// Bound non-streaming uploads to avoid exhausting WASM memory.
 		totalSize := data.Get("byteLength").Int()
-		src := make([]byte, totalSize)
-		js.CopyBytesToGo(src, data)
+		if totalSize > maxUploadSize {
+			return nil, fmt.Errorf("sftpUpload: file too large (%d bytes, max %d). Use sftpUploadStreamStart for large files", totalSize, maxUploadSize)
+		}
 
 		// Create remote file.
-		f, err := client.Create(remotePath)
+		f, err := ss.client.Create(remotePath)
 		if err != nil {
 			return nil, fmt.Errorf("sftpUpload: create: %w", err)
 		}
-		defer f.Close()
+		defer closeQuietly(f)
 
 		hasProgress := hasProgressFn(onProgress)
 
-		// Write in chunks with progress reporting.
+		// Copy/write in chunks directly from JS Uint8Array to avoid a full extra buffer.
 		written := 0
 		for written < totalSize {
 			if isAborted(signal) {
@@ -63,7 +71,13 @@ func sftpUpload(sftpID string, remotePath string, data js.Value, onProgress js.V
 			if end > totalSize {
 				end = totalSize
 			}
-			n, err := f.Write(src[written:end])
+
+			jsChunk := data.Call("subarray", written, end)
+			chunk := make([]byte, end-written)
+			js.CopyBytesToGo(chunk, jsChunk)
+
+			n, err := f.Write(chunk)
+			scrubBytes(chunk)
 			if err != nil {
 				return nil, fmt.Errorf("sftpUpload: write at %d: %w", written, err)
 			}
@@ -85,13 +99,17 @@ func sftpUpload(sftpID string, remotePath string, data js.Value, onProgress js.V
 //	GoSSH.sftpDownload(sftpId, remotePath, onProgress?, signal?: AbortSignal) → Promise<Uint8Array>
 func sftpDownload(sftpID string, remotePath string, onProgress js.Value, signal js.Value) js.Value {
 	return newPromise(func() (any, error) {
-		client, err := getSFTPClient(sftpID)
+		ss, err := getSFTPSession(sftpID)
 		if err != nil {
 			return nil, err
 		}
+		remotePath, err = validateSFTPPath(remotePath, ss.strict)
+		if err != nil {
+			return nil, fmt.Errorf("sftpDownload: %w", err)
+		}
 
 		// Get file size for progress reporting.
-		info, err := client.Stat(remotePath)
+		info, err := ss.client.Stat(remotePath)
 		if err != nil {
 			return nil, fmt.Errorf("sftpDownload: stat: %w", err)
 		}
@@ -100,11 +118,11 @@ func sftpDownload(sftpID string, remotePath string, onProgress js.Value, signal 
 			return nil, fmt.Errorf("sftpDownload: file too large (%d bytes, max %d). Use sftpDownloadStream for large files", totalSize, maxDownloadSize)
 		}
 
-		f, err := client.Open(remotePath)
+		f, err := ss.client.Open(remotePath)
 		if err != nil {
 			return nil, fmt.Errorf("sftpDownload: open: %w", err)
 		}
-		defer f.Close()
+		defer closeQuietly(f)
 
 		hasProgress := hasProgressFn(onProgress)
 
@@ -155,6 +173,7 @@ var activeStreams sync.Map // streamID → *streamState
 type streamState struct {
 	sftpID     string
 	remotePath string
+	token      string
 	totalSize  int64
 	read       int64
 	file       io.ReadCloser
@@ -174,7 +193,7 @@ func (s *streamState) closeDone() {
 // Flow:
 // 1. Go registers a stream with a unique ID
 // 2. Go tells JS to navigate to /_stream/<streamID>/<filename>
-// 3. Service Worker intercepts the fetch and calls GoSSH._streamPull(streamID)
+// 3. Service Worker intercepts the fetch and calls GoSSH._streamPull(streamID, streamToken)
 // 4. Go returns chunks until EOF
 // 5. Browser saves the file progressively
 //
@@ -183,25 +202,31 @@ func (s *streamState) closeDone() {
 //	GoSSH.sftpDownloadStream(sftpId, remotePath, onProgress?) → Promise<void>
 func sftpDownloadStream(sftpID string, remotePath string, onProgress js.Value) js.Value {
 	return newPromise(func() (any, error) {
-		client, err := getSFTPClient(sftpID)
+		ss, err := getSFTPSession(sftpID)
 		if err != nil {
 			return nil, err
 		}
+		remotePath, err = validateSFTPPath(remotePath, ss.strict)
+		if err != nil {
+			return nil, fmt.Errorf("sftpDownloadStream: %w", err)
+		}
 
-		info, err := client.Stat(remotePath)
+		info, err := ss.client.Stat(remotePath)
 		if err != nil {
 			return nil, fmt.Errorf("sftpDownloadStream: stat: %w", err)
 		}
 
-		f, err := client.Open(remotePath)
+		f, err := ss.client.Open(remotePath)
 		if err != nil {
 			return nil, fmt.Errorf("sftpDownloadStream: open: %w", err)
 		}
 
 		streamID := generateID()
+		streamToken := generateID()
 		state := &streamState{
 			sftpID:     sftpID,
 			remotePath: remotePath,
+			token:      streamToken,
 			totalSize:  info.Size(),
 			file:       f,
 			done:       make(chan struct{}),
@@ -219,13 +244,14 @@ func sftpDownloadStream(sftpID string, remotePath string, onProgress js.Value) j
 
 		// Tell JS to trigger download via Service Worker.
 		streamInfo := map[string]any{
-			"streamId":  streamID,
-			"filename":  filename,
-			"size":      info.Size(),
-			"mimeType":  "application/octet-stream",
+			"streamId":    streamID,
+			"streamToken": streamToken,
+			"filename":    filename,
+			"size":        info.Size(),
+			"mimeType":    "application/octet-stream",
 		}
 
-		// JS side will: location.href = `/_stream/${streamId}/${filename}`
+		// JS side will: location.href = `/_stream/${streamId}/${streamToken}/${filename}`
 		// or create a hidden anchor and click it.
 		js.Global().Call("dispatchEvent",
 			js.Global().Get("CustomEvent").New("gossh-stream-download", map[string]any{
@@ -239,7 +265,7 @@ func sftpDownloadStream(sftpID string, remotePath string, onProgress js.Value) j
 		select {
 		case <-state.done:
 		case <-timeout.C:
-			state.file.Close()
+			closeQuietly(state.file)
 			state.closeDone()
 			activeStreams.Delete(streamID)
 			return nil, fmt.Errorf("sftpDownloadStream: timed out after 30 minutes")
@@ -300,12 +326,19 @@ func (u *uploadState) getErr() error {
 //	GoSSH.sftpUploadStreamStart(sftpId, remotePath, size) → Promise<string>
 func sftpUploadStreamStart(sftpID string, remotePath string, size int64) js.Value {
 	return newPromise(func() (any, error) {
-		client, err := getSFTPClient(sftpID)
+		if size < 0 {
+			return nil, fmt.Errorf("sftpUploadStreamStart: size must be non-negative")
+		}
+		ss, err := getSFTPSession(sftpID)
 		if err != nil {
 			return nil, err
 		}
+		remotePath, err = validateSFTPPath(remotePath, ss.strict)
+		if err != nil {
+			return nil, fmt.Errorf("sftpUploadStreamStart: %w", err)
+		}
 
-		f, err := client.Create(remotePath)
+		f, err := ss.client.Create(remotePath)
 		if err != nil {
 			return nil, fmt.Errorf("sftpUploadStreamStart: create: %w", err)
 		}
@@ -412,13 +445,20 @@ func sftpUploadStreamCancel(uploadID string) {
 }
 
 // streamPull is called by the Service Worker to pull the next chunk.
-// Called from JS as: GoSSH._streamPull(streamId) → {data: Uint8Array|null, done: bool}
-func streamPull(streamID string) js.Value {
+// Called from JS as: GoSSH._streamPull(streamId, streamToken) → {data: Uint8Array|null, done: bool}
+func streamPull(streamID, streamToken string) js.Value {
+	if !isHexID(streamID, 32) || !isHexID(streamToken, 32) {
+		return js.ValueOf(map[string]any{"data": js.Null(), "done": true})
+	}
+
 	val, ok := activeStreams.Load(streamID)
 	if !ok {
 		return js.ValueOf(map[string]any{"data": js.Null(), "done": true})
 	}
 	state := val.(*streamState)
+	if state.token != streamToken {
+		return js.ValueOf(map[string]any{"data": js.Null(), "done": true})
+	}
 
 	chunk := make([]byte, transferChunkSize)
 	n, err := state.file.Read(chunk)
@@ -430,28 +470,37 @@ func streamPull(streamID string) js.Value {
 			"done": err != nil,
 		}
 		if err != nil {
-			state.file.Close()
+			closeQuietly(state.file)
 			state.closeDone()
 		}
 		return js.ValueOf(result)
 	}
 
 	// EOF or error — close stream.
-	state.file.Close()
+	closeQuietly(state.file)
 	state.closeDone()
 
 	return js.ValueOf(map[string]any{"data": js.Null(), "done": true})
 }
 
 // streamCancel cancels a streaming download.
-// Called from JS as: GoSSH._streamCancel(streamId)
-func streamCancel(streamID string) {
-	val, ok := activeStreams.LoadAndDelete(streamID)
+// Called from JS as: GoSSH._streamCancel(streamId, streamToken)
+func streamCancel(streamID, streamToken string) {
+	if !isHexID(streamID, 32) || !isHexID(streamToken, 32) {
+		return
+	}
+
+	val, ok := activeStreams.Load(streamID)
 	if !ok {
 		return
 	}
 	state := val.(*streamState)
-	state.file.Close()
+	if state.token != streamToken {
+		return
+	}
+
+	activeStreams.Delete(streamID)
+	closeQuietly(state.file)
 	state.closeDone()
 }
 

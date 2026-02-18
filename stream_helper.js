@@ -11,8 +11,8 @@
  *   // Or import and call: initGoSSHStreaming()
  */
 
-(function () {
-  'use strict';
+(() => {
+  const MAX_BLOB_FALLBACK_SIZE = 100 * 1024 * 1024; // 100 MB
 
   // Register Service Worker for streaming.
   async function registerStreamWorker() {
@@ -22,7 +22,7 @@
     }
 
     try {
-      await navigator.serviceWorker.register('/stream_worker.js', { scope: '/' });
+      await navigator.serviceWorker.register('/stream_worker.js', { scope: '/_stream/' });
       await navigator.serviceWorker.ready;
       console.log('[gossh] Stream Service Worker registered');
       return true;
@@ -34,12 +34,12 @@
 
   // Handle pull requests from the Service Worker.
   navigator.serviceWorker?.addEventListener('message', (event) => {
-    const { type, streamId } = event.data;
+    const { type, streamId, streamToken } = event.data;
 
     if (type === 'gossh-stream-pull' && event.ports[0]) {
       const port = event.ports[0];
       try {
-        const result = GoSSH._streamPull(streamId);
+        const result = GoSSH._streamPull(streamId, streamToken);
         if (result.done || !result.data) {
           port.postMessage({ data: null, done: true });
         } else {
@@ -56,20 +56,21 @@
     }
 
     if (type === 'gossh-stream-cancel') {
-      try { GoSSH._streamCancel(streamId); } catch (e) { /* ignore */ }
+      try { GoSSH._streamCancel(streamId, streamToken); } catch { /* ignore */ }
     }
   });
 
   // Handle download trigger events from Go WASM.
+  // detail: { streamId, streamToken, filename, size, mimeType }
   let swAvailable = false;
 
   window.addEventListener('gossh-stream-download', async (event) => {
-    const { streamId, filename, size } = event.detail;
+    const { streamId, streamToken, filename, size } = event.detail;
 
     if (swAvailable) {
       // Trigger download via Service Worker stream.
       const link = document.createElement('a');
-      link.href = `/_stream/${streamId}/${encodeURIComponent(filename)}`;
+      link.href = `/_stream/${streamId}/${streamToken}/${encodeURIComponent(filename)}`;
       link.download = filename;
       link.style.display = 'none';
       document.body.appendChild(link);
@@ -78,11 +79,16 @@
     } else {
       // Fallback: pull chunks asynchronously into a Blob and trigger download.
       // Uses setTimeout to yield to the event loop between chunks.
+      if (typeof size === 'number' && size > MAX_BLOB_FALLBACK_SIZE) {
+        console.error(`[gossh] Blob fallback disabled for large file (${size} bytes > ${MAX_BLOB_FALLBACK_SIZE})`);
+        try { GoSSH._streamCancel(streamId, streamToken); } catch { /* ignore */ }
+        return;
+      }
       console.warn(`[gossh] Using Blob fallback for ${filename} (${size} bytes)`);
       const chunks = [];
       const pullChunk = () => {
         try {
-          const result = GoSSH._streamPull(streamId);
+          const result = GoSSH._streamPull(streamId, streamToken);
           if (result.done || !result.data) {
             // All chunks collected — create blob and download.
             const blob = new Blob(chunks);

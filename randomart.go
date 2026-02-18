@@ -12,7 +12,7 @@
 package gossh
 
 import (
-	"crypto/md5"
+	"crypto/md5" // #nosec G501 -- OpenSSH-compatible randomart intentionally uses MD5 visualization bytes.
 	"encoding/hex"
 	"fmt"
 	"strings"
@@ -27,7 +27,13 @@ const (
 
 // artChars maps visit counts to display characters (same as OpenSSH).
 // Index 0 = never visited (space), higher = more visits, last two = start/end.
-var artChars = []byte(" .o+=*BOX@%&#/^SE")
+const artCharsStr = " .o+=*BOX@%&#/^SE"
+
+var (
+	artChars       = []byte(artCharsStr)
+	artStartMarker = byte(len(artChars) - 2) // #nosec G115 -- bounded static table.
+	artEndMarker   = byte(len(artChars) - 1) // #nosec G115 -- bounded static table.
+)
 
 // RandomArt generates an ASCII art representation of an SSH public key fingerprint.
 // The output matches OpenSSH's visual host key format.
@@ -48,7 +54,7 @@ var artChars = []byte(" .o+=*BOX@%&#/^SE")
 func RandomArt(pubKey ssh.PublicKey) string {
 	// Use MD5 hash of the raw public key for the bishop walk
 	// (matches OpenSSH's original randomart implementation).
-	rawHash := md5.Sum(pubKey.Marshal())
+	rawHash := md5.Sum(pubKey.Marshal()) // #nosec G401 -- visualization only, not cryptographic security.
 	return randomArtFromHash(rawHash[:], pubKey.Type(), keyBits(pubKey), "MD5")
 }
 
@@ -107,8 +113,8 @@ func randomArtFromHash(hash []byte, keyType string, bits int, hashName string) s
 
 	// Mark start and end positions with special values.
 	startX, startY := artWidth/2, artHeight/2
-	field[startY][startX] = byte(len(artChars) - 2) // 'S'
-	field[y][x] = byte(len(artChars) - 1)           // 'E'
+	field[startY][startX] = artStartMarker // 'S'
+	field[y][x] = artEndMarker             // 'E'
 
 	// Render the grid.
 	var sb strings.Builder

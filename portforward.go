@@ -14,11 +14,12 @@ package gossh
 import (
 	"context"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
-	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall/js"
@@ -30,6 +31,8 @@ import (
 const (
 	// maxConcurrentHandlers limits goroutines per tunnel to prevent OOM.
 	maxConcurrentHandlers = 100
+	// tcpInboundQueueSize bounds per-connection pending proxy frames.
+	tcpInboundQueueSize = 256
 )
 
 // portForward represents an active port forwarding tunnel.
@@ -77,18 +80,22 @@ func portForwardStart(sessionID string, config js.Value) js.Value {
 		remoteHost := jsString(config.Get("remoteHost"))
 		remotePort := jsInt(config.Get("remotePort"), 0)
 		proxyTunnelURL := jsString(config.Get("proxyTunnelUrl"))
+		allowInsecureWS := jsBool(config.Get("allowInsecureWS"))
 
 		if remoteHost == "" || remotePort == 0 || proxyTunnelURL == "" {
 			return nil, fmt.Errorf("portForwardStart: remoteHost, remotePort, and proxyTunnelUrl required")
+		}
+		if containsCRLF(remoteHost) || containsCTL(remoteHost) || strings.ContainsAny(remoteHost, " \t") {
+			return nil, fmt.Errorf("portForwardStart: invalid remoteHost")
 		}
 		if remotePort < 1 || remotePort > 65535 {
 			return nil, fmt.Errorf("portForwardStart: invalid remotePort %d (must be 1-65535)", remotePort)
 		}
 
 		// Build tunnel WebSocket URL with properly encoded query parameters.
-		u, err := url.Parse(proxyTunnelURL)
+		u, err := parseWebSocketURL(proxyTunnelURL, allowInsecureWS)
 		if err != nil {
-			return nil, fmt.Errorf("portForwardStart: invalid proxyTunnelUrl: %w", err)
+			return nil, fmt.Errorf("portForwardStart: proxy URL: %w", err)
 		}
 		if token := jsString(config.Get("token")); token != "" {
 			q := u.Query()
@@ -103,7 +110,7 @@ func portForwardStart(sessionID string, config js.Value) js.Value {
 		tunnelConn, err := DialWebSocket(ctx, tunnelWsURL)
 		if err != nil {
 			cancel()
-			return nil, fmt.Errorf("portForwardStart: dial tunnel: %w", err)
+			return nil, publicErr("portForwardStart: failed to establish tunnel WebSocket", err)
 		}
 
 		// Read tunnel_ready message from proxy.
@@ -115,12 +122,12 @@ func portForwardStart(sessionID string, config js.Value) js.Value {
 			RawPort   int    `json:"rawPort"`
 		}
 		if err := json.NewDecoder(io.LimitReader(tunnelConn, 1<<20)).Decode(&ready); err != nil {
-			tunnelConn.Close()
+			closeQuietly(tunnelConn)
 			cancel()
-			return nil, fmt.Errorf("portForwardStart: parse tunnel_ready: %w", err)
+			return nil, publicErr("portForwardStart: invalid tunnel_ready message", err)
 		}
 		if ready.Type != "tunnel_ready" {
-			tunnelConn.Close()
+			closeQuietly(tunnelConn)
 			cancel()
 			return nil, fmt.Errorf("portForwardStart: expected tunnel_ready, got %q", ready.Type)
 		}
@@ -184,6 +191,10 @@ func (fwd *portForward) handleTunnelMessages(sess *session) {
 					case ch.(chan []byte) <- pCopy:
 					case <-fwd.ctx.Done():
 						return
+					default:
+						// Connection consumer is overloaded; fail this forwarded TCP stream.
+						fwd.sendTCPClose(connID)
+						fwd.tcpChans.Delete(connID)
 					}
 				}
 				continue
@@ -260,7 +271,7 @@ func parseBinaryFrame(data []byte) (connID string, payload []byte) {
 	if len(data) < 4 {
 		return "", nil
 	}
-	idLen := int(data[0])<<24 | int(data[1])<<16 | int(data[2])<<8 | int(data[3])
+	idLen := int(uint32(data[0])<<24 | uint32(data[1])<<16 | uint32(data[2])<<8 | uint32(data[3]))
 	if idLen <= 0 || idLen > 256 || 4+idLen > len(data) {
 		return "", nil
 	}
@@ -290,14 +301,14 @@ func sshDialWithTimeout(ctx context.Context, client *ssh.Client, network, addr s
 		// Close any late connection to prevent leak.
 		go func() {
 			if r := <-ch; r.conn != nil {
-				r.conn.Close()
+				closeQuietly(r.conn)
 			}
 		}()
 		return nil, fmt.Errorf("ssh dial %s timed out after %v", addr, timeout)
 	case <-ctx.Done():
 		go func() {
 			if r := <-ch; r.conn != nil {
-				r.conn.Close()
+				closeQuietly(r.conn)
 			}
 		}()
 		return nil, ctx.Err()
@@ -307,41 +318,55 @@ func sshDialWithTimeout(ctx context.Context, client *ssh.Client, network, addr s
 // handleHTTPRequest forwards an HTTP request from the proxy through an SSH
 // direct-tcpip channel to the remote service.
 func (fwd *portForward) handleHTTPRequest(sess *session, reqID, method, path string, headers map[string]string, body string) {
+	var err error
+	method, path, err = validateForwardRequestLine(method, path)
+	if err != nil {
+		fwd.sendHTTPResponse(reqID, 400, map[string]string{}, "invalid forwarded request", "")
+		return
+	}
+
 	// Open SSH direct-tcpip channel to the remote service.
 	addr := fmt.Sprintf("%s:%d", fwd.remoteHost, fwd.remotePort)
 	channel, err := sshDialWithTimeout(fwd.ctx, sess.sshClient, "tcp", addr, 30*time.Second)
 	if err != nil {
-		fwd.sendHTTPResponse(reqID, 502, map[string]string{}, fmt.Sprintf("SSH dial failed: %v", err), "")
+		fwd.sendHTTPResponse(reqID, 502, map[string]string{}, "upstream connection failed", "")
 		return
 	}
-	defer channel.Close()
+	defer closeQuietly(channel)
 
 	// Build and send HTTP request through the SSH channel.
-	httpReq := fmt.Sprintf("%s %s HTTP/1.1\r\nHost: %s:%d\r\n", method, path, fwd.remoteHost, fwd.remotePort)
+	var reqBuilder strings.Builder
+	reqBuilder.WriteString(fmt.Sprintf("%s %s HTTP/1.1\r\nHost: %s:%d\r\n", method, path, fwd.remoteHost, fwd.remotePort))
 	for k, v := range headers {
+		k = strings.TrimSpace(k)
+		v = strings.TrimSpace(v)
+		if k == "" {
+			continue
+		}
+
 		// Skip hop-by-hop and proxy headers.
-		switch k {
-		case "Host", "Connection", "Upgrade", "Keep-Alive",
-			"Transfer-Encoding", "TE", "Trailer", "Proxy-Authorization",
-			"Proxy-Connection":
+		switch strings.ToLower(k) {
+		case "host", "connection", "upgrade", "keep-alive",
+			"transfer-encoding", "te", "trailer", "proxy-authorization",
+			"proxy-connection":
 			continue
 		}
 		// Sanitize: reject header values containing \r or \n (header injection).
-		if containsCRLF(k) || containsCRLF(v) {
+		if containsCRLF(k) || containsCRLF(v) || containsCTL(v) || !isHTTPToken(k) {
 			continue
 		}
-		httpReq += fmt.Sprintf("%s: %s\r\n", k, v)
+		reqBuilder.WriteString(fmt.Sprintf("%s: %s\r\n", k, v))
 	}
 	if body != "" {
-		httpReq += fmt.Sprintf("Content-Length: %d\r\n", len(body))
+		reqBuilder.WriteString(fmt.Sprintf("Content-Length: %d\r\n", len(body)))
 	}
-	httpReq += "Connection: close\r\n\r\n"
+	reqBuilder.WriteString("Connection: close\r\n\r\n")
 	if body != "" {
-		httpReq += body
+		reqBuilder.WriteString(body)
 	}
 
-	if _, err := channel.Write([]byte(httpReq)); err != nil {
-		fwd.sendHTTPResponse(reqID, 502, map[string]string{}, "write failed", "")
+	if _, err := channel.Write([]byte(reqBuilder.String())); err != nil {
+		fwd.sendHTTPResponse(reqID, 502, map[string]string{}, "request write failed", "")
 		return
 	}
 
@@ -358,16 +383,15 @@ func (fwd *portForward) handleHTTPRequest(sess *session, reqID, method, path str
 	respHeaders := map[string]string{}
 	respBody := respStr
 
-	if headerEnd := findHeaderEnd(respStr); headerEnd > 0 {
+	if headerEnd := findHeaderEnd(respStr); headerEnd >= 0 {
 		headerPart := respStr[:headerEnd]
 		respBody = respStr[headerEnd+4:] // Skip \r\n\r\n
 
 		// Parse status line and headers.
 		lines := splitLines(headerPart)
 		if len(lines) > 0 {
-			statusLine := lines[0]
-			if spaceIdx := findSpace(statusLine); spaceIdx > 0 && spaceIdx+4 <= len(statusLine) {
-				fmt.Sscanf(statusLine[spaceIdx+1:spaceIdx+4], "%d", &status)
+			if parsedStatus, ok := parseHTTPStatusCode(lines[0]); ok {
+				status = parsedStatus
 			}
 		}
 
@@ -378,14 +402,14 @@ func (fwd *portForward) handleHTTPRequest(sess *session, reqID, method, path str
 				if colonIdx+2 < len(line) {
 					val = line[colonIdx+2:]
 				}
-				respHeaders[key] = val
+				respHeaders[strings.TrimSpace(key)] = strings.TrimSpace(val)
 			}
 		}
 	}
 
 	// Encode binary response bodies as base64.
 	bodyEncoding := ""
-	contentType := respHeaders["Content-Type"]
+	contentType := getHeaderValue(respHeaders, "content-type")
 	if contentType != "" && !isTextContentType(contentType) {
 		bodyEncoding = "base64"
 		respBody = base64.StdEncoding.EncodeToString([]byte(respBody))
@@ -403,10 +427,10 @@ func (fwd *portForward) handleTCPOpen(sess *session, connID string) {
 		fwd.sendTCPClose(connID)
 		return
 	}
-	defer channel.Close()
+	defer closeQuietly(channel)
 
 	// Register a channel to receive incoming data for this connection.
-	inCh := make(chan []byte, 256)
+	inCh := make(chan []byte, tcpInboundQueueSize)
 	fwd.tcpChans.Store(connID, inCh)
 	defer fwd.tcpChans.Delete(connID)
 
@@ -438,9 +462,10 @@ func (fwd *portForward) handleTCPOpen(sess *session, connID string) {
 			n, err := channel.Read(buf)
 			if n > 0 {
 				frame := buildBinaryFrameWASM(connID, buf[:n])
-				fwd.wsMu.Lock()
-				_, writeErr := fwd.tunnelConn.Write(frame)
-				fwd.wsMu.Unlock()
+				if len(frame) == 0 {
+					return
+				}
+				writeErr := fwd.writeTunnel(frame)
 				if writeErr != nil {
 					return
 				}
@@ -458,7 +483,7 @@ func (fwd *portForward) handleTCPOpen(sess *session, connID string) {
 		case <-fwd.ctx.Done():
 			// Tunnel closing — don't wait further.
 			// Close SSH channel to unblock any stuck Read/Write.
-			channel.Close()
+			closeQuietly(channel)
 			<-done // Now safe to drain since channel is closed.
 		}
 	}
@@ -470,14 +495,21 @@ func (fwd *portForward) handleTCPOpen(sess *session, connID string) {
 func buildBinaryFrameWASM(connID string, payload []byte) []byte {
 	idBytes := []byte(connID)
 	idLen := len(idBytes)
+	if idLen > int(^uint32(0)) {
+		return nil
+	}
 	frame := make([]byte, 4+idLen+len(payload))
-	frame[0] = byte(idLen >> 24)
-	frame[1] = byte(idLen >> 16)
-	frame[2] = byte(idLen >> 8)
-	frame[3] = byte(idLen)
+	binary.BigEndian.PutUint32(frame[:4], uint32(idLen)) // #nosec G115 -- guarded above.
 	copy(frame[4:], idBytes)
 	copy(frame[4+idLen:], payload)
 	return frame
+}
+
+func (fwd *portForward) writeTunnel(data []byte) error {
+	fwd.wsMu.Lock()
+	defer fwd.wsMu.Unlock()
+	_, err := fwd.tunnelConn.Write(data)
+	return err
 }
 
 // sendHTTPResponse sends an HTTP response back through the tunnel WebSocket.
@@ -493,18 +525,18 @@ func (fwd *portForward) sendHTTPResponse(reqID string, status int, headers map[s
 		resp["bodyEncoding"] = bodyEncoding
 	}
 	data, _ := json.Marshal(resp)
-	fwd.wsMu.Lock()
-	fwd.tunnelConn.Write(data)
-	fwd.wsMu.Unlock()
+	if err := fwd.writeTunnel(data); err != nil {
+		fwd.cleanup()
+	}
 }
 
 // sendTCPClose notifies the proxy that a TCP connection has closed.
 func (fwd *portForward) sendTCPClose(connID string) {
 	msg := map[string]string{"type": "tcp_close", "connId": connID}
 	data, _ := json.Marshal(msg)
-	fwd.wsMu.Lock()
-	fwd.tunnelConn.Write(data)
-	fwd.wsMu.Unlock()
+	if err := fwd.writeTunnel(data); err != nil {
+		fwd.cleanup()
+	}
 }
 
 // cleanup closes the port forward and removes it from the store.
@@ -513,7 +545,7 @@ func (fwd *portForward) cleanup() {
 	fwd.cleanupOnce.Do(func() {
 		fwd.cancel()
 		if fwd.tunnelConn != nil {
-			fwd.tunnelConn.Close()
+			closeQuietly(fwd.tunnelConn)
 		}
 		forwardStore.Delete(fwd.id)
 	})
@@ -584,15 +616,6 @@ func splitLines(s string) []string {
 	return lines
 }
 
-func findSpace(s string) int {
-	for i := 0; i < len(s); i++ {
-		if s[i] == ' ' {
-			return i
-		}
-	}
-	return -1
-}
-
 func findColon(s string) int {
 	for i := 0; i < len(s); i++ {
 		if s[i] == ':' {
@@ -612,6 +635,44 @@ func isTextContentType(ct string) bool {
 		strings.Contains(ct, "html")
 }
 
+func parseHTTPStatusCode(statusLine string) (int, bool) {
+	fields := strings.Fields(statusLine)
+	if len(fields) < 2 {
+		return 0, false
+	}
+	code, err := strconv.Atoi(fields[1])
+	if err != nil || code < 100 || code > 599 {
+		return 0, false
+	}
+	return code, true
+}
+
+func getHeaderValue(headers map[string]string, want string) string {
+	for k, v := range headers {
+		if strings.EqualFold(k, want) {
+			return v
+		}
+	}
+	return ""
+}
+
+func isHTTPToken(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c <= 32 || c >= 127 {
+			return false
+		}
+		switch c {
+		case '(', ')', '<', '>', '@', ',', ';', ':', '\\', '"', '/', '[', ']', '?', '=', '{', '}':
+			return false
+		}
+	}
+	return true
+}
+
 // containsCRLF checks if a string contains \r or \n (header injection guard).
 func containsCRLF(s string) bool {
 	for i := 0; i < len(s); i++ {
@@ -620,4 +681,33 @@ func containsCRLF(s string) bool {
 		}
 	}
 	return false
+}
+
+func containsCTL(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < 0x20 && c != '\t') || c == 0x7f {
+			return true
+		}
+	}
+	return false
+}
+
+func validateForwardRequestLine(method, path string) (string, string, error) {
+	method = strings.ToUpper(strings.TrimSpace(method))
+	if !isHTTPToken(method) {
+		return "", "", fmt.Errorf("invalid HTTP method")
+	}
+
+	path = strings.TrimSpace(path)
+	if path == "" {
+		path = "/"
+	}
+	if containsCRLF(path) || containsCTL(path) {
+		return "", "", fmt.Errorf("invalid HTTP path")
+	}
+	if !(strings.HasPrefix(path, "/") || path == "*" || strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://")) {
+		return "", "", fmt.Errorf("invalid HTTP path")
+	}
+	return method, path, nil
 }
