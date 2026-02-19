@@ -72,7 +72,10 @@ type wsConn struct {
 // The context controls the dial timeout — if the WebSocket doesn't reach
 // OPEN state before ctx is cancelled, the connection is aborted.
 func DialWebSocket(ctx context.Context, url string) (net.Conn, error) {
-	connCtx, cancel := context.WithCancel(ctx)
+	// Use background context for connection lifetime — dial ctx is only for open timeout.
+	// If we derived from ctx, the deferred cancel in sshConnect would kill the WebSocket
+	// as soon as connect() resolves.
+	connCtx, cancel := context.WithCancel(context.Background())
 
 	c := &wsConn{
 		ctx:    connCtx,
@@ -294,10 +297,18 @@ func (c *wsConn) Close() error {
 	return nil
 }
 
-// cleanup releases JS function references to prevent memory leaks.
+// cleanup removes event listeners and releases JS function references.
 // Safe to call multiple times — only the first call releases.
 func (c *wsConn) cleanup() {
 	c.cleanupOnce.Do(func() {
+		// Remove event listeners BEFORE releasing functions.
+		// This prevents "call to released function" if the browser fires
+		// an event (e.g., onclose) after we Release() the js.Func.
+		c.ws.Call("removeEventListener", "open", c.onOpen)
+		c.ws.Call("removeEventListener", "message", c.onMessage)
+		c.ws.Call("removeEventListener", "error", c.onError)
+		c.ws.Call("removeEventListener", "close", c.onClose)
+
 		c.onOpen.Release()
 		c.onMessage.Release()
 		c.onError.Release()

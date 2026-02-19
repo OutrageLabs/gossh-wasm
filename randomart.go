@@ -130,7 +130,11 @@ func randomArtFromHash(hash []byte, keyType string, bits int, hashName string) s
 	sb.WriteString("[")
 	sb.WriteString(header)
 	sb.WriteString("]")
-	sb.WriteString(strings.Repeat("-", artWidth-topPad-len(header)-2))
+	rightPad := artWidth - topPad - len(header) - 2
+	if rightPad < 0 {
+		rightPad = 0
+	}
+	sb.WriteString(strings.Repeat("-", rightPad))
 	sb.WriteString("+\n")
 
 	// Grid rows.
@@ -156,7 +160,11 @@ func randomArtFromHash(hash []byte, keyType string, bits int, hashName string) s
 	sb.WriteString("[")
 	sb.WriteString(hashName)
 	sb.WriteString("]")
-	sb.WriteString(strings.Repeat("-", artWidth-botPad-len(hashName)-2))
+	rightBotPad := artWidth - botPad - len(hashName) - 2
+	if rightBotPad < 0 {
+		rightBotPad = 0
+	}
+	sb.WriteString(strings.Repeat("-", rightBotPad))
 	sb.WriteString("+")
 
 	return sb.String()

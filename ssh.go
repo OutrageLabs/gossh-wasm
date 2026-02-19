@@ -222,6 +222,9 @@ func sshConnect(config js.Value) js.Value {
 		cols := jsInt(config.Get("cols"), 80)
 		rows := jsInt(config.Get("rows"), 24)
 
+		consoleLog := js.Global().Get("console")
+		consoleLog.Call("log", "[gossh] Requesting PTY", cols, "x", rows)
+
 		modes := ssh.TerminalModes{
 			ssh.ECHO:          1,
 			ssh.TTY_OP_ISPEED: 14400,
@@ -232,6 +235,7 @@ func sshConnect(config js.Value) js.Value {
 			closeQuietly(sshClient)
 			return nil, publicErr("connect: PTY request failed", err)
 		}
+		consoleLog.Call("log", "[gossh] PTY allocated OK")
 
 		// Set up stdin pipe.
 		stdin, err := sshSession.StdinPipe()
@@ -248,6 +252,7 @@ func sshConnect(config js.Value) js.Value {
 			closeQuietly(sshClient)
 			return nil, publicErr("connect: failed to open stdout pipe", err)
 		}
+		consoleLog.Call("log", "[gossh] Pipes created, starting shell...")
 
 		// Start shell.
 		if err := sshSession.Shell(); err != nil {
@@ -255,6 +260,7 @@ func sshConnect(config js.Value) js.Value {
 			closeQuietly(sshClient)
 			return nil, publicErr("connect: failed to start shell", err)
 		}
+		consoleLog.Call("log", "[gossh] Shell started OK, session:", sessionID)
 
 		// Create session context for lifecycle management.
 		sessCtx, sessCancel := context.WithCancel(context.Background())
@@ -282,17 +288,36 @@ func sshConnect(config js.Value) js.Value {
 
 		sessionStore.Store(sessionID, sess)
 
-		// Goroutine: read stdout and forward to JS onData callback.
+		// Goroutine: wait for SSH session to finish.
+		// sshSession.Wait() keeps the channel alive until the remote shell exits.
 		go func() {
+			err := sshSession.Wait()
+			if err != nil {
+				js.Global().Get("console").Call("log", "[gossh] session.Wait() returned:", err.Error())
+			} else {
+				js.Global().Get("console").Call("log", "[gossh] session.Wait() returned: clean exit")
+			}
+		}()
+
+		// Goroutine: read stdout and forward to JS onData callback.
+		// Uses sess.onData (copied js.Value) — NOT config.Get("onData") —
+		// because config may be GC'd by JS after connect() Promise resolves.
+		go func() {
+			js.Global().Get("console").Call("log", "[gossh] stdout reader goroutine started")
+			onData := sess.onData
 			buf := make([]byte, 32*1024)
+			readCount := 0
 			for {
 				n, err := stdout.Read(buf)
+				readCount++
 				if n > 0 {
-					if onData, ok := getCallback(config, "onData"); ok {
+					js.Global().Get("console").Call("log", "[gossh] stdout read:", n, "bytes (read #"+fmt.Sprintf("%d", readCount)+")")
+					if !onData.IsUndefined() && !onData.IsNull() && onData.Type() == js.TypeFunction {
 						onData.Invoke(bytesToUint8Array(buf[:n]))
 					}
 				}
 				if err != nil {
+					js.Global().Get("console").Call("log", "[gossh] stdout read error:", err.Error(), "(read #"+fmt.Sprintf("%d", readCount)+")")
 					break
 				}
 			}

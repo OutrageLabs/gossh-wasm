@@ -143,6 +143,20 @@ func RegisterAPI() {
 		return sftpChmod(args[0].String(), args[1].String(), uint32(mode))
 	})
 
+	gossh["sftpGetwd"] = js.FuncOf(func(this js.Value, args []js.Value) any {
+		if len(args) < 1 {
+			return jsError(errMissingConfig)
+		}
+		return sftpGetwd(args[0].String())
+	})
+
+	gossh["sftpRealPath"] = js.FuncOf(func(this js.Value, args []js.Value) any {
+		if len(args) < 2 {
+			return jsError(errMissingConfig)
+		}
+		return sftpRealPath(args[0].String(), args[1].String())
+	})
+
 	gossh["sftpUpload"] = js.FuncOf(func(this js.Value, args []js.Value) any {
 		if len(args) < 3 {
 			return jsError(errMissingConfig)

@@ -234,6 +234,40 @@ func sftpChmod(sftpID string, remotePath string, mode uint32) js.Value {
 	})
 }
 
+// sftpGetwd returns the current working directory (home) for an SFTP session.
+// Called from JS as: GoSSH.sftpGetwd(sftpId) → Promise<string>
+func sftpGetwd(sftpID string) js.Value {
+	return newPromise(func() (any, error) {
+		ss, err := getSFTPSession(sftpID)
+		if err != nil {
+			return nil, err
+		}
+
+		cwd, err := ss.client.Getwd()
+		if err != nil {
+			return nil, fmt.Errorf("sftpGetwd: %w", err)
+		}
+		return cwd, nil
+	})
+}
+
+// sftpRealPath resolves a path to its absolute form on the remote server.
+// Called from JS as: GoSSH.sftpRealPath(sftpId, path) → Promise<string>
+func sftpRealPath(sftpID string, remotePath string) js.Value {
+	return newPromise(func() (any, error) {
+		ss, err := getSFTPSession(sftpID)
+		if err != nil {
+			return nil, err
+		}
+
+		resolved, err := ss.client.RealPath(remotePath)
+		if err != nil {
+			return nil, fmt.Errorf("sftpRealPath: %w", err)
+		}
+		return resolved, nil
+	})
+}
+
 // getSFTPSession retrieves an SFTP session by ID.
 func getSFTPSession(sftpID string) (*sftpSession, error) {
 	val, ok := sftpStore.Load(sftpID)
