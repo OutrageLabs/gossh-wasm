@@ -64,6 +64,7 @@ func sshConnect(config js.Value) js.Value {
 		port := jsInt(config.Get("port"), 22)
 		username := jsString(config.Get("username"))
 		allowInsecureWS := jsBool(config.Get("allowInsecureWS"))
+		directTunnel := jsBool(config.Get("directTunnel"))
 		strictSFTPPaths := jsBool(config.Get("strictSFTPPaths"))
 
 		if proxyURL == "" || host == "" || username == "" {
@@ -151,13 +152,15 @@ func sshConnect(config js.Value) js.Value {
 			if err != nil {
 				return nil, err
 			}
-			q := u.Query()
-			q.Set("host", host)
-			q.Set("port", fmt.Sprintf("%d", port))
-			if token := jsString(config.Get("token")); token != "" {
-				q.Set("token", token)
+			if !directTunnel {
+				q := u.Query()
+				q.Set("host", host)
+				q.Set("port", fmt.Sprintf("%d", port))
+				if token := jsString(config.Get("token")); token != "" {
+					q.Set("token", token)
+				}
+				u.RawQuery = q.Encode()
 			}
-			u.RawQuery = q.Encode()
 
 			dialCtx, dialCancel := context.WithTimeout(context.Background(), dialTimeout)
 			defer dialCancel()
